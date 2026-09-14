@@ -1,12 +1,18 @@
-﻿'use client';
+'use client';
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
-import { Plus, MessageSquare, ArrowRight, Trash2 } from 'lucide-react';
+import { useSession } from '@/lib/useSession';
+import { isPushSupported, subscribeToPush, unsubscribeFromPush, getCurrentSubscription } from '@/lib/push';
+import AuthForm from '@/components/AuthForm';
+import AvatarModal from '@/components/AvatarModal';
+import { Plus, MessageSquare, ArrowRight, Trash2, LogOut, Camera, Bell, BellOff } from 'lucide-react';
 
 export default function HomePage() {
   const router = useRouter();
+  const session = useSession();
+
   const [myRooms, setMyRooms] = useState([]);
   const [roomTitle, setRoomTitle] = useState('');
   const [roomPassword, setRoomPassword] = useState('');
@@ -14,16 +20,66 @@ export default function HomePage() {
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [loading, setLoading] = useState(false);
 
+  // 내 프로필 사진
+  const [avatarUrl, setAvatarUrl] = useState(null);
+  const [showAvatarModal, setShowAvatarModal] = useState(false);
+
+  // 이 기기의 푸시 알림 구독 여부 (계정 전체 기준 — 한 번 켜두면 모든 방의 메시지 알림을 받음)
+  const [notifEnabled, setNotifEnabled] = useState(null);
+  const [notifLoading, setNotifLoading] = useState(false);
+
+  // 로그인 계정 기준으로 "내 대화방 목록"을 서버(room_members)에서 불러온다.
   useEffect(() => {
-    const saved = localStorage.getItem('my_chat_rooms');
-    if (saved) {
-      try {
-        setMyRooms(JSON.parse(saved));
-      } catch (e) {
-        setMyRooms([]);
-      }
+    if (!session) return;
+    supabase
+      .from('room_members')
+      .select('room_id, joined_at, rooms(id, title)')
+      .eq('user_id', session.user.id)
+      .order('joined_at', { ascending: false })
+      .then(({ data, error }) => {
+        if (!error && data) {
+          setMyRooms(data.map((row) => row.rooms).filter(Boolean));
+        }
+      });
+
+    supabase
+      .from('profiles')
+      .select('avatar_url')
+      .eq('user_id', session.user.id)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data) setAvatarUrl(data.avatar_url);
+      });
+  }, [session]);
+
+  // 이 기기에 이미 켜져 있는 알림 구독이 있는지 확인해서 방울 아이콘 초기 상태를 맞춘다.
+  useEffect(() => {
+    if (!session) return;
+    if (!isPushSupported()) { setNotifEnabled(false); return; }
+    getCurrentSubscription().then((sub) => setNotifEnabled(!!sub));
+  }, [session]);
+
+  const handleToggleNotif = async () => {
+    if (!session?.user?.id || notifLoading) return;
+    if (!isPushSupported()) {
+      alert('이 브라우저(또는 iOS의 경우 홈 화면에 추가하지 않은 사파리 탭)에서는 푸시 알림을 지원하지 않습니다.');
+      return;
     }
-  }, []);
+    setNotifLoading(true);
+    try {
+      if (notifEnabled) {
+        await unsubscribeFromPush(session.user.id);
+        setNotifEnabled(false);
+      } else {
+        await subscribeToPush(session.user.id);
+        setNotifEnabled(true);
+      }
+    } catch (err) {
+      alert(err?.message || '알림 설정 중 오류가 발생했습니다.');
+    } finally {
+      setNotifLoading(false);
+    }
+  };
 
   const handleCreateRoom = async (e) => {
     e.preventDefault();
@@ -51,8 +107,7 @@ export default function HomePage() {
 
     sessionStorage.setItem(`unlocked_${shortCode}`, 'true');
 
-    const updated = [{ id: data.id, title: data.title }, ...myRooms.filter((r) => r.id !== data.id)];
-    localStorage.setItem('my_chat_rooms', JSON.stringify(updated));
+    await supabase.from('room_members').insert([{ room_id: data.id, user_id: session.user.id }]);
 
     router.push(`/room/${shortCode}`);
   };
@@ -68,20 +123,32 @@ export default function HomePage() {
       return;
     }
 
-    const updated = [{ id: data.id, title: data.title }, ...myRooms.filter((r) => r.id !== data.id)];
-    localStorage.setItem('my_chat_rooms', JSON.stringify(updated));
+    await supabase
+      .from('room_members')
+      .upsert([{ room_id: data.id, user_id: session.user.id }], { onConflict: 'room_id,user_id', ignoreDuplicates: true });
 
     router.push(`/room/${code}`);
   };
 
-  const handleRemoveFromList = (e, roomId) => {
+  const handleRemoveFromList = async (e, roomId) => {
     e.stopPropagation();
     if (confirm('대화방 목록에서 삭제하시겠습니까?')) {
-      const updated = myRooms.filter((r) => r.id !== roomId);
-      setMyRooms(updated);
-      localStorage.setItem('my_chat_rooms', JSON.stringify(updated));
+      setMyRooms((prev) => prev.filter((r) => r.id !== roomId));
+      await supabase.from('room_members').delete().eq('room_id', roomId).eq('user_id', session.user.id);
     }
   };
+
+  if (session === undefined) {
+    return (
+      <div className="flex min-h-[100dvh] items-center justify-center text-sm text-neutral-400">
+        확인 중...
+      </div>
+    );
+  }
+
+  if (session === null) {
+    return <AuthForm />;
+  }
 
   return (
     <div className="min-h-[100dvh] bg-neutral-100 flex items-center justify-center p-0 md:p-6">
@@ -89,22 +156,50 @@ export default function HomePage() {
       <main className="w-full max-w-2xl bg-white min-h-[100dvh] md:min-h-[85vh] md:rounded-3xl shadow-xl border border-neutral-200 flex flex-col overflow-hidden">
         {/* 상단 헤더 */}
         <header className="flex items-center justify-between px-6 py-4 bg-white border-b border-neutral-200">
-          <div className="flex items-center space-x-3">
-            <div className="w-10 h-10 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center">
-              <MessageSquare size={22} />
-            </div>
-            <div>
+          <div className="flex items-center space-x-3 min-w-0">
+            <button
+              onClick={() => setShowAvatarModal(true)}
+              title="내 프로필 사진 변경"
+              className="relative w-10 h-10 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center shrink-0 overflow-hidden border border-blue-100 hover:opacity-80 transition"
+            >
+              {avatarUrl ? (
+                <img src={avatarUrl} alt="내 프로필" className="w-full h-full object-cover" />
+              ) : (
+                <MessageSquare size={22} />
+              )}
+              <span className="absolute bottom-0 right-0 w-4 h-4 bg-neutral-900/80 text-white rounded-tl-md flex items-center justify-center">
+                <Camera size={9} />
+              </span>
+            </button>
+            <div className="min-w-0">
               <h1 className="font-bold text-lg text-neutral-900">대화방 목록</h1>
-              <p className="text-xs text-neutral-400">참여 중인 비공개 대화방</p>
+              <p className="text-xs text-neutral-400 truncate">{session.user.email}</p>
             </div>
           </div>
-          <button
-            onClick={() => setShowCreateModal(true)}
-            className="flex items-center space-x-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-xl shadow-sm transition active:scale-95"
-          >
-            <Plus size={16} />
-            <span>새 대화방 만들기</span>
-          </button>
+          <div className="flex items-center space-x-2 shrink-0">
+            <button
+              onClick={handleToggleNotif}
+              disabled={notifLoading || notifEnabled === null}
+              title={notifEnabled ? '알림 끄기' : '알림 켜기 (모든 대화방)'}
+              className="p-2 text-neutral-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition disabled:opacity-40"
+            >
+              {notifEnabled ? <Bell size={18} className="text-blue-600" /> : <BellOff size={18} />}
+            </button>
+            <button
+              onClick={() => setShowCreateModal(true)}
+              className="flex items-center space-x-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-xl shadow-sm transition active:scale-95"
+            >
+              <Plus size={16} />
+              <span className="hidden sm:inline">새 대화방 만들기</span>
+            </button>
+            <button
+              onClick={() => supabase.auth.signOut()}
+              title="로그아웃"
+              className="p-2 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition"
+            >
+              <LogOut size={18} />
+            </button>
+          </div>
         </header>
 
         {/* 6자리 초대 코드로 입장 영역 */}
@@ -228,6 +323,16 @@ export default function HomePage() {
               </form>
             </div>
           </div>
+        )}
+
+        {/* 프로필 사진 변경 모달창 */}
+        {showAvatarModal && (
+          <AvatarModal
+            userId={session.user.id}
+            avatarUrl={avatarUrl}
+            onChange={setAvatarUrl}
+            onClose={() => setShowAvatarModal(false)}
+          />
         )}
       </main>
     </div>
