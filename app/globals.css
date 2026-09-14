@@ -19,13 +19,25 @@
   }
 }
 
-html, body {
-  overflow-x: hidden;
-  width: 100%;
-  overscroll-behavior-y: none;
+html {
+  height: 100%;
+  overflow: hidden;
 }
 
 body {
+  /* 모바일에서 입력창(input)에 포커스가 잡혀 키보드가 올라올 때, 브라우저가
+     "포커스된 요소를 보이게" 하려고 body 전체를 스크롤시켜서 상단 헤더(방
+     제목, 목록/알림/설정 아이콘)까지 화면 밖으로 밀려 올라가는 문제가 있었다.
+     body 자체를 화면에 고정(position: fixed)해서 문서 자체는 스크롤이 아예
+     불가능하게 막고, 각 페이지 내부의 지정된 영역(overflow-y-auto)만 스크롤되게
+     한다. h-[100dvh]와 함께 쓰면 키보드가 올라올 때는 가용 높이(dvh)만 줄어들어
+     내부 메시지 영역만 작아지고, 헤더/입력창 위치는 그대로 유지된다. */
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;

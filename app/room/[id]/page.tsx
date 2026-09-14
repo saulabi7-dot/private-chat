@@ -421,7 +421,7 @@ export default function RoomPage() {
   }
 
   return (
-    <div className="flex flex-col h-[100dvh] max-w-2xl mx-auto bg-[#EBF2F7] border-x border-neutral-300 shadow-2xl relative">
+    <div className="flex flex-col w-full h-[100dvh] max-w-2xl mx-auto bg-[#EBF2F7] border-x border-neutral-300 shadow-2xl relative">
       {/* 상단 헤더 */}
       <header className="flex items-center justify-between px-3 py-2.5 bg-white/95 backdrop-blur border-b border-neutral-200 sticky top-0 z-20 shadow-xs">
         <button
