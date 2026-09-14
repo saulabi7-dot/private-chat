@@ -109,11 +109,16 @@ export default function RoomPage() {
         setRoom(data);
         // 링크로 바로 들어온 사람도 "내 대화방 목록"에 자동 등록되도록
         // 계정(room_members) 기준으로 동기화한다 (기존 localStorage 동작을 대체).
+        // 실패해도 조용히 무시되던 것을 콘솔에 남겨서, 목록에 방이 안 뜰 때
+        // 원인(RLS, 네트워크 등)을 바로 알 수 있게 한다.
         supabase
           .from('room_members')
           .upsert([{ room_id: data.id, user_id: session.user.id }], {
             onConflict: 'room_id,user_id',
             ignoreDuplicates: true,
+          })
+          .then(({ error }) => {
+            if (error) console.error('[room] room_members 동기화 실패:', error.message);
           });
 
         if (sessionStorage.getItem(`unlocked_${roomId}`) === 'true' || !data.password) {
@@ -148,32 +153,64 @@ export default function RoomPage() {
 
   useEffect(() => {
     if (!isJoined || !isUnlocked || !roomId) return;
-    supabase.from('messages').select('*').eq('room_id', roomId).order('created_at', { ascending: true }).then(({ data }) => {
-      if (data) {
+    let cancelled = false;
+    let ch = null;
+
+    const fetchMessages = () => {
+      supabase.from('messages').select('*').eq('room_id', roomId).order('created_at', { ascending: true }).then(({ data }) => {
+        if (cancelled || !data) return;
         setMessages(data);
         loadProfilesFor(data.map((m) => m.user_id));
+      });
+    };
+
+    const subscribe = () => {
+      ch = supabase
+        .channel(`room_${roomId}`)
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, (p) => {
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === p.new.id)) return prev;
+            const filtered = prev.filter((m) => !(m.sender === p.new.sender && m.content === p.new.content && typeof m.id === 'number' && m.id > 1000000000000));
+            return [...filtered, p.new];
+          });
+          loadProfilesFor([p.new.user_id]);
+        })
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, (p) => {
+          setMessages((prev) => prev.map((m) => (m.id === p.new.id ? p.new : m)));
+        })
+        .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, (p) => {
+          setMessages((prev) => prev.filter((m) => m.id !== p.old.id));
+        })
+        .subscribe();
+    };
+
+    fetchMessages();
+    subscribe();
+
+    // 폰 화면이 꺼지거나 앱이 백그라운드로 내려가면 모바일 브라우저가 realtime
+    // 웹소켓 연결을 끊어버려서, 그 사이 온 메시지가 화면을 다시 켤 때까지
+    // 안 보이는 문제가 있었다. 화면이 다시 보이는 시점(visibilitychange/focus)에
+    // 메시지를 서버에서 다시 통째로 불러오고, 채널이 끊어져 있으면(state !== 'joined')
+    // 새로 구독해서 놓친 메시지가 즉시 반영되게 한다.
+    const handleWake = () => {
+      if (document.visibilityState !== 'visible') return;
+      fetchMessages();
+      if (!ch || ch.state !== 'joined') {
+        if (ch) supabase.removeChannel(ch);
+        subscribe();
       }
-    });
+    };
+    document.addEventListener('visibilitychange', handleWake);
+    window.addEventListener('focus', handleWake);
+    window.addEventListener('pageshow', handleWake);
 
-    const ch = supabase
-      .channel(`room_${roomId}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, (p) => {
-        setMessages((prev) => {
-          if (prev.some((m) => m.id === p.new.id)) return prev;
-          const filtered = prev.filter((m) => !(m.sender === p.new.sender && m.content === p.new.content && typeof m.id === 'number' && m.id > 1000000000000));
-          return [...filtered, p.new];
-        });
-        loadProfilesFor([p.new.user_id]);
-      })
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, (p) => {
-        setMessages((prev) => prev.map((m) => (m.id === p.new.id ? p.new : m)));
-      })
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, (p) => {
-        setMessages((prev) => prev.filter((m) => m.id !== p.old.id));
-      })
-      .subscribe();
-
-    return () => { supabase.removeChannel(ch); };
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', handleWake);
+      window.removeEventListener('focus', handleWake);
+      window.removeEventListener('pageshow', handleWake);
+      if (ch) supabase.removeChannel(ch);
+    };
   }, [isJoined, isUnlocked, roomId]);
 
   useEffect(() => {

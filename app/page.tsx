@@ -31,16 +31,23 @@ export default function HomePage() {
   // 로그인 계정 기준으로 "내 대화방 목록"을 서버(room_members)에서 불러온다.
   useEffect(() => {
     if (!session) return;
-    supabase
-      .from('room_members')
-      .select('room_id, joined_at, rooms(id, title)')
-      .eq('user_id', session.user.id)
-      .order('joined_at', { ascending: false })
-      .then(({ data, error }) => {
-        if (!error && data) {
-          setMyRooms(data.map((row) => row.rooms).filter(Boolean));
-        }
-      });
+
+    const fetchRooms = () => {
+      supabase
+        .from('room_members')
+        .select('room_id, joined_at, rooms(id, title)')
+        .eq('user_id', session.user.id)
+        .order('joined_at', { ascending: false })
+        .then(({ data, error }) => {
+          if (!error && data) {
+            setMyRooms(data.map((row) => row.rooms).filter(Boolean));
+          } else if (error) {
+            console.error('[home] 대화방 목록 조회 실패:', error.message);
+          }
+        });
+    };
+
+    fetchRooms();
 
     supabase
       .from('profiles')
@@ -50,6 +57,25 @@ export default function HomePage() {
       .then(({ data }) => {
         if (data) setAvatarUrl(data.avatar_url);
       });
+
+    // 방에 들어갔다가 뒤로가기로 돌아오면 브라우저가(특히 모바일 사파리) 이 화면을
+    // 다시 마운트하지 않고 캐시(bfcache)에서 그대로 복원하는 경우가 있어서, 방금
+    // 새로 들어간 방이 목록에 반영되지 않은 옛 상태로 보이는 문제가 있었다.
+    // 화면이 다시 보이는 시점(pageshow/visibilitychange/focus)마다 목록을 새로
+    // 불러와서 항상 최신 상태로 맞춘다.
+    const handleWake = () => {
+      if (document.visibilityState !== 'visible') return;
+      fetchRooms();
+    };
+    document.addEventListener('visibilitychange', handleWake);
+    window.addEventListener('focus', handleWake);
+    window.addEventListener('pageshow', handleWake);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleWake);
+      window.removeEventListener('focus', handleWake);
+      window.removeEventListener('pageshow', handleWake);
+    };
   }, [session]);
 
   // 이 기기에 이미 켜져 있는 알림 구독이 있는지 확인해서 방울 아이콘 초기 상태를 맞춘다.
