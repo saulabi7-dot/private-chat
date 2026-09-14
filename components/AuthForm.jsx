@@ -12,6 +12,24 @@ export default function AuthForm() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [resetLoading, setResetLoading] = useState(false);
+
+  const handleForgotPassword = async () => {
+    if (!email.trim()) {
+      alert('먼저 이메일을 입력해 주세요.');
+      return;
+    }
+    setResetLoading(true);
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+      redirectTo: `${window.location.origin}/reset-password`,
+    });
+    setResetLoading(false);
+    if (error) {
+      alert('재설정 링크 발송 실패: ' + error.message);
+    } else {
+      alert('입력하신 이메일로 비밀번호 재설정 링크를 보냈습니다. 메일함(스팸함 포함)을 확인해 주세요.');
+    }
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -100,6 +118,17 @@ export default function AuthForm() {
               className="w-full pl-9 pr-3.5 py-2.5 text-sm bg-neutral-50 border rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
           </div>
+
+          {mode === 'login' && (
+            <button
+              type="button"
+              onClick={handleForgotPassword}
+              disabled={resetLoading}
+              className="w-full text-right text-xs text-neutral-400 hover:text-blue-600 transition disabled:opacity-50"
+            >
+              {resetLoading ? '전송 중...' : '비밀번호를 잊으셨나요?'}
+            </button>
+          )}
 
           <button
             type="submit"
