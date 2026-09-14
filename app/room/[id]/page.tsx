@@ -5,12 +5,15 @@ import { useParams, useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import { useSession } from '@/lib/useSession';
 import { isPushSupported, subscribeToPush, unsubscribeFromPush, getCurrentSubscription } from '@/lib/push';
+import { resizeImageFile } from '@/lib/compressImage';
 import AuthForm from '@/components/AuthForm';
 import AvatarModal from '@/components/AvatarModal';
+import MemberListModal from '@/components/MemberListModal';
+import PhotoGalleryModal from '@/components/PhotoGalleryModal';
 import {
   ChevronLeft, MoreVertical, Copy, Trash2, Send,
   Smile, Image as ImgIcon, Lock, X, Edit2, CheckSquare, Square,
-  Zap, Sparkles, UserCircle2, Bell, BellOff
+  Zap, Sparkles, UserCircle2, Bell, BellOff, Users, Images
 } from 'lucide-react';
 
 const PACKS = [
@@ -45,6 +48,8 @@ export default function RoomPage() {
   const [activePack, setActivePack] = useState('couple');
   const [stickers, setStickers] = useState({});
   const [showMenu, setShowMenu] = useState(false);
+  const [showMemberList, setShowMemberList] = useState(false);
+  const [showPhotoGallery, setShowPhotoGallery] = useState(false);
 
   // 수정 및 선택 삭제
   const [editingId, setEditingId] = useState(null);
@@ -52,8 +57,8 @@ export default function RoomPage() {
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState([]);
 
-  // 사진 전송 모달 (화질 선택)
-  const [pendingImage, setPendingImage] = useState(null); // { file, previewUrl }
+  // 사진 전송 모달 (화질 선택) — 여러 장을 한 번에 선택할 수 있도록 배열로 관리
+  const [pendingImages, setPendingImages] = useState(null); // [{ file, previewUrl }] | null
   const [imageQuality, setImageQuality] = useState('compressed'); // 'compressed' | 'original'
   const [isCompressing, setIsCompressing] = useState(false);
 
@@ -130,6 +135,23 @@ export default function RoomPage() {
       setLoading(false);
     });
   }, [roomId, session]);
+
+  // 닉네임이 정해지면(직접 입력했거나 sessionStorage에 저장된 게 있어서
+  // 자동으로 입장한 경우 모두) room_members에도 닉네임을 갱신해 둔다.
+  // 참여자 목록 화면이 "닉네임 미설정" 대신 실제 닉네임을 보여줄 수 있으려면
+  // 서버(room_members)에 닉네임이 저장되어 있어야 한다.
+  useEffect(() => {
+    if (!isJoined || !nickname.trim() || !roomId || !session) return;
+    supabase
+      .from('room_members')
+      .upsert([{ room_id: roomId, user_id: session.user.id, nickname: nickname.trim() }], {
+        onConflict: 'room_id,user_id',
+        ignoreDuplicates: false,
+      })
+      .then(({ error }) => {
+        if (error) console.error('[room] 닉네임 동기화 실패:', error.message);
+      });
+  }, [isJoined, nickname, roomId, session]);
 
   // 메시지에 등장하는 계정들의 프로필 사진을 한꺼번에 불러와 채워 넣는다.
   const loadProfilesFor = (userIds) => {
@@ -214,10 +236,10 @@ export default function RoomPage() {
   }, [isJoined, isUnlocked, roomId]);
 
   useEffect(() => {
-    if (!isSelectMode && !editingId && !pendingImage) {
+    if (!isSelectMode && !editingId && !pendingImages) {
       scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [messages, isSelectMode, editingId, pendingImage]);
+  }, [messages, isSelectMode, editingId, pendingImages]);
 
   // 아바타 변경 모달에 보여줄 내 프로필 사진도 미리 캐시에 채워둔다.
   useEffect(() => {
@@ -274,6 +296,17 @@ export default function RoomPage() {
     }).catch(() => {});
   };
 
+  // 여러 장을 한 번에 보냈을 때는 "사진 N장을 보냈습니다"로 알림을 한 번만
+  // 보낸다 (notifyNewMessage를 사진 수만큼 반복 호출하면 알림이 그만큼 따로 울림).
+  const notifyPhotos = (count) => {
+    if (!session?.access_token) return;
+    fetch('/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
+      body: JSON.stringify({ roomId, title: room?.title || '새 메시지', body: `${nickname}: 사진 ${count}장을 보냈습니다` }),
+    }).catch(() => {});
+  };
+
   const handleUnlock = (e) => {
     e.preventDefault();
     if (passwordInput === room.password) {
@@ -297,6 +330,34 @@ export default function RoomPage() {
       alert('전송 실패: ' + error.message);
     } else {
       notifyNewMessage(content);
+    }
+  };
+
+  // 사진 여러 장을 한 번에 전송한다. 메시지 자체는 기존 스키마 그대로 한 장당
+  // 한 행으로 저장하되, 낙관적 업데이트와 insert를 배열로 한 번에 처리하고
+  // 푸시 알림은 notifyPhotos로 한 번만 보내 사진 수만큼 알림이 울리는 걸 막는다.
+  const sendMany = async (contents) => {
+    if (!contents || contents.length === 0) return;
+    const nowIso = new Date().toISOString();
+    const userId = session?.user?.id ?? null;
+    const tempRows = contents.map((content, i) => ({
+      id: Date.now() + i,
+      room_id: roomId,
+      sender: nickname,
+      content,
+      created_at: nowIso,
+      user_id: userId,
+    }));
+    setMessages((prev) => [...prev, ...tempRows]);
+
+    const { error } = await supabase
+      .from('messages')
+      .insert(contents.map((content) => ({ room_id: roomId, sender: nickname, content, user_id: userId })));
+
+    if (error) {
+      alert('전송 실패: ' + error.message);
+    } else {
+      notifyPhotos(contents.length);
     }
   };
 
@@ -348,49 +409,44 @@ export default function RoomPage() {
     }
   };
 
-  // 사진 선택 시 미리보기 모달 띄우기
+  // 사진 선택 시 미리보기 모달 띄우기 (여러 장 동시 선택 지원)
   const handleImageFileSelect = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const previewUrl = URL.createObjectURL(file);
-    setPendingImage({ file, previewUrl });
+    const files = Array.from(e.target.files || []).filter((f) => f.type.startsWith('image/'));
     e.target.value = '';
+    if (files.length === 0) return;
+
+    setPendingImages(files.map((file) => ({ file, previewUrl: URL.createObjectURL(file) })));
   };
 
-  // 선택한 화질(일반/원본)로 최종 전송
-  const handleConfirmSendImage = () => {
-    if (!pendingImage?.file) return;
+  // 선택한 화질(일반/원본)로 최종 전송. 여러 장이면 각각 순차적으로 리사이즈한
+  // 뒤 한 번에 sendMany로 보내고, 한 장이면 기존과 동일하게 send를 그대로 쓴다.
+  const handleConfirmSendImage = async () => {
+    if (!pendingImages || pendingImages.length === 0) return;
     setIsCompressing(true);
 
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        // 일반(축소): 720px / 0.6 품질 (초고속, 약 35KB)
-        // 원본(고화질): 1920px (Full HD) / 0.85 품질 (선명한 고화질)
-        const isOrig = imageQuality === 'original';
-        const maxDim = isOrig ? 1920 : 720;
-        const quality = isOrig ? 0.85 : 0.6;
+    // 일반(축소): 720px / 0.6 품질 (초고속, 약 35KB)
+    // 원본(고화질): 1920px (Full HD) / 0.85 품질 (선명한 고화질)
+    const isOrig = imageQuality === 'original';
+    const maxDim = isOrig ? 1920 : 720;
+    const quality = isOrig ? 0.85 : 0.6;
 
-        const nw = img.naturalWidth || img.width || 600;
-        const nh = img.naturalHeight || img.height || 600;
-        const scale = Math.min(1, maxDim / Math.max(nw, nh));
-        canvas.width = Math.round(nw * scale);
-        canvas.height = Math.round(nh * scale);
-
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        const base64 = canvas.toDataURL('image/jpeg', quality);
-
-        send(base64);
-        setIsCompressing(false);
-        setPendingImage(null);
-      };
-      img.src = ev.target?.result;
-    };
-    reader.readAsDataURL(pendingImage.file);
+    try {
+      const contents = [];
+      for (const { file } of pendingImages) {
+        contents.push(await resizeImageFile(file, { maxDim, quality }));
+      }
+      if (contents.length === 1) {
+        await send(contents[0]);
+      } else {
+        await sendMany(contents);
+      }
+    } catch (err) {
+      alert('이미지 처리 중 오류가 발생했습니다: ' + (err?.message || ''));
+    } finally {
+      pendingImages.forEach((p) => URL.revokeObjectURL(p.previewUrl));
+      setIsCompressing(false);
+      setPendingImages(null);
+    }
   };
 
   const join = (e) => {
@@ -510,6 +566,30 @@ export default function RoomPage() {
                 <Copy size={15} className="text-neutral-500" />
                 <span>초대 링크 복사</span>
               </button>
+
+              <button
+                onClick={() => {
+                  setShowMemberList(true);
+                  setShowMenu(false);
+                }}
+                className="w-full flex items-center space-x-2.5 px-3.5 py-2.5 text-xs text-neutral-700 hover:bg-neutral-50 transition"
+              >
+                <Users size={15} className="text-blue-600" />
+                <span>참여자 목록</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setShowPhotoGallery(true);
+                  setShowMenu(false);
+                }}
+                className="w-full flex items-center space-x-2.5 px-3.5 py-2.5 text-xs text-neutral-700 hover:bg-neutral-50 transition"
+              >
+                <Images size={15} className="text-blue-600" />
+                <span>사진첩</span>
+              </button>
+
+              <div className="h-[1px] bg-neutral-100 my-1"></div>
 
               <button
                 onClick={() => {
@@ -734,18 +814,50 @@ export default function RoomPage() {
         />
       )}
 
-      {/* 사진 전송 전 화질 선택 모달 (카카오톡 스타일) */}
-      {pendingImage && (
+      {/* 참여자 목록 모달 */}
+      {showMemberList && (
+        <MemberListModal
+          roomId={roomId}
+          myUserId={session.user.id}
+          onClose={() => setShowMemberList(false)}
+        />
+      )}
+
+      {/* 사진첩(썸네일/날짜별) 모달 */}
+      {showPhotoGallery && (
+        <PhotoGalleryModal
+          messages={messages}
+          onClose={() => setShowPhotoGallery(false)}
+        />
+      )}
+
+      {/* 사진 전송 전 화질 선택 모달 (카카오톡 스타일, 여러 장 동시 선택 지원) */}
+      {pendingImages && pendingImages.length > 0 && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in duration-100">
           <div className="w-full max-w-sm bg-white rounded-3xl p-5 shadow-2xl border border-neutral-200 space-y-4">
-            <h3 className="font-bold text-sm text-neutral-900 text-center">사진 전송</h3>
-            
-            {/* 사진 미리보기 */}
-            <div className="rounded-2xl overflow-hidden max-h-60 bg-neutral-100 flex items-center justify-center border border-neutral-200">
-              <img src={pendingImage.previewUrl} alt="미리보기" className="max-h-60 w-auto object-contain" />
-            </div>
+            <h3 className="font-bold text-sm text-neutral-900 text-center">
+              사진 전송{pendingImages.length > 1 && ` (${pendingImages.length}장 선택됨)`}
+            </h3>
 
-            {/* 화질 선택 버튼 (일반 vs 원본) */}
+            {/* 사진 미리보기: 한 장이면 크게, 여러 장이면 가로 스크롤 썸네일 스트립 */}
+            {pendingImages.length === 1 ? (
+              <div className="rounded-2xl overflow-hidden max-h-60 bg-neutral-100 flex items-center justify-center border border-neutral-200">
+                <img src={pendingImages[0].previewUrl} alt="미리보기" className="max-h-60 w-auto object-contain" />
+              </div>
+            ) : (
+              <div className="flex space-x-2 overflow-x-auto pb-1 -mx-1 px-1">
+                {pendingImages.map((p, i) => (
+                  <img
+                    key={i}
+                    src={p.previewUrl}
+                    alt={`미리보기 ${i + 1}`}
+                    className="w-20 h-20 object-cover rounded-xl border border-neutral-200 shrink-0"
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* 화질 선택 버튼 (일반 vs 원본) — 선택한 모든 장에 공통 적용 */}
             <div className="grid grid-cols-2 gap-2 p-1 bg-neutral-100 rounded-2xl">
               <button
                 type="button"
@@ -785,7 +897,10 @@ export default function RoomPage() {
               <button
                 type="button"
                 disabled={isCompressing}
-                onClick={() => setPendingImage(null)}
+                onClick={() => {
+                  pendingImages.forEach((p) => URL.revokeObjectURL(p.previewUrl));
+                  setPendingImages(null);
+                }}
                 className="flex-1 py-2.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 text-xs font-bold rounded-xl transition"
               >
                 취소
@@ -796,7 +911,11 @@ export default function RoomPage() {
                 onClick={handleConfirmSendImage}
                 className="flex-1 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl shadow transition disabled:opacity-50 flex items-center justify-center space-x-1"
               >
-                <span>{isCompressing ? '전송 처리 중...' : '전송하기'}</span>
+                <span>
+                  {isCompressing
+                    ? '전송 처리 중...'
+                    : `전송하기${pendingImages.length > 1 ? ` (${pendingImages.length}장)` : ''}`}
+                </span>
               </button>
             </div>
           </div>
@@ -856,7 +975,7 @@ export default function RoomPage() {
         )}
 
         <form onSubmit={handleSendText} className="flex items-center p-2.5 space-x-1.5">
-          <input type="file" ref={fileRef} accept="image/*" className="hidden" onChange={handleImageFileSelect} />
+          <input type="file" ref={fileRef} accept="image/*" multiple className="hidden" onChange={handleImageFileSelect} />
           
           <button
             type="button"
