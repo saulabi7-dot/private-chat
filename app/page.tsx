@@ -9,9 +9,15 @@ import AuthForm from '@/components/AuthForm';
 import AvatarModal from '@/components/AvatarModal';
 import { Plus, MessageSquare, ArrowRight, Trash2, LogOut, Camera, Bell, BellOff } from 'lucide-react';
 
+// 대화방 생성은 당분간 저장 용량 관리를 위해 마스터 계정만 할 수 있게 제한한다.
+// (실제 강제는 DB의 RESTRICTIVE RLS 정책이 하고, 여기서는 UI만 숨긴다 —
+// supabase/migrations/008_restrict_room_creation_to_master.sql 참고)
+const MASTER_EMAIL = 'saulabi7@gmail.com';
+
 export default function HomePage() {
   const router = useRouter();
   const session = useSession();
+  const isMaster = session?.user?.email === MASTER_EMAIL;
 
   const [myRooms, setMyRooms] = useState([]);
   const [roomTitle, setRoomTitle] = useState('');
@@ -32,7 +38,25 @@ export default function HomePage() {
   useEffect(() => {
     if (!session) return;
 
+    // 마스터 계정은 관리 목적으로 room_members 가입 여부와 무관하게 존재하는
+    // 모든 대화방을 본다(DB의 "master can read all rooms" 정책이 이를 허용).
+    // 일반 사용자는 기존대로 자신이 참여한(room_members) 방만 본다.
     const fetchRooms = () => {
+      if (isMaster) {
+        supabase
+          .from('rooms')
+          .select('id, title')
+          .order('id', { ascending: true })
+          .then(({ data, error }) => {
+            if (!error && data) {
+              setMyRooms(data);
+            } else if (error) {
+              console.error('[home] 전체 대화방 목록 조회 실패:', error.message);
+            }
+          });
+        return;
+      }
+
       supabase
         .from('room_members')
         .select('room_id, joined_at, rooms(id, title)')
@@ -76,13 +100,28 @@ export default function HomePage() {
       window.removeEventListener('focus', handleWake);
       window.removeEventListener('pageshow', handleWake);
     };
-  }, [session]);
+  }, [session, isMaster]);
 
-  // 이 기기에 이미 켜져 있는 알림 구독이 있는지 확인해서 방울 아이콘 초기 상태를 맞춘다.
+  // 브라우저에 남아 있는 push 구독을 로그인 계정의 서버 행과 다시 동기화한다.
+  // PC Chrome/Edge에서 로컬 구독은 존재하지만 DB 행이 없어진 경우에도 자동 복구된다.
   useEffect(() => {
     if (!session) return;
-    if (!isPushSupported()) { setNotifEnabled(false); return; }
-    getCurrentSubscription().then((sub) => setNotifEnabled(!!sub));
+    if (!isPushSupported()) {
+      Promise.resolve().then(() => setNotifEnabled(false));
+      return;
+    }
+    getCurrentSubscription().then(async (sub) => {
+      if (sub && Notification.permission === 'granted') {
+        try {
+          await subscribeToPush(session.user.id, { requestPermission: false });
+          setNotifEnabled(true);
+          return;
+        } catch (err) {
+          console.error('[push] 기존 구독 서버 동기화 실패:', err);
+        }
+      }
+      setNotifEnabled(false);
+    });
   }, [session]);
 
   const handleToggleNotif = async () => {
@@ -109,6 +148,12 @@ export default function HomePage() {
 
   const handleCreateRoom = async (e) => {
     e.preventDefault();
+    if (!isMaster) {
+      // 버튼 자체를 숨겨서 여기까지 올 일은 없지만, 실제 차단은 DB RLS가 하므로
+      // 클라이언트 쪽도 방어적으로 한 번 더 막아둔다.
+      alert('대화방 생성은 현재 관리자 계정만 가능합니다.');
+      return;
+    }
     if (!roomPassword.trim()) {
       alert('비밀번호를 입력해 주세요.');
       return;
@@ -201,7 +246,9 @@ export default function HomePage() {
               </span>
             </button>
             <div className="min-w-0">
-              <h1 className="font-bold text-lg text-neutral-900">대화방 목록</h1>
+              <h1 className="font-bold text-lg text-neutral-900">
+                {isMaster ? '전체 대화방 목록' : '대화방 목록'}
+              </h1>
               <p className="text-xs text-neutral-400 truncate">{session.user.email}</p>
             </div>
           </div>
@@ -214,13 +261,15 @@ export default function HomePage() {
             >
               {notifEnabled ? <Bell size={18} className="text-blue-600" /> : <BellOff size={18} />}
             </button>
-            <button
-              onClick={() => setShowCreateModal(true)}
-              className="flex items-center space-x-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-xl shadow-sm transition active:scale-95"
-            >
-              <Plus size={16} />
-              <span className="hidden sm:inline">새 대화방 만들기</span>
-            </button>
+            {isMaster && (
+              <button
+                onClick={() => setShowCreateModal(true)}
+                className="flex items-center space-x-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-xl shadow-sm transition active:scale-95"
+              >
+                <Plus size={16} />
+                <span className="hidden sm:inline">새 대화방 만들기</span>
+              </button>
+            )}
             <button
               onClick={() => supabase.auth.signOut()}
               title="로그아웃"
@@ -256,8 +305,12 @@ export default function HomePage() {
           {myRooms.length === 0 ? (
             <div className="text-center py-24 text-neutral-400">
               <MessageSquare size={48} className="mx-auto mb-3 opacity-30" />
-              <p className="font-semibold text-sm text-neutral-600">참여 중인 대화방이 없습니다.</p>
-              <p className="mt-1 text-xs text-neutral-400">우측 상단에서 새 방을 만들거나 초대 코드를 입력해 보세요.</p>
+              <p className="font-semibold text-sm text-neutral-600">
+                {isMaster ? '생성된 대화방이 없습니다.' : '참여 중인 대화방이 없습니다.'}
+              </p>
+              <p className="mt-1 text-xs text-neutral-400">
+                {isMaster ? '우측 상단에서 새 방을 만들어 보세요.' : '위에서 초대 코드를 입력해 대화방에 참여해 보세요.'}
+              </p>
             </div>
           ) : (
             myRooms.map((room) => (
@@ -286,13 +339,15 @@ export default function HomePage() {
                   <span className="hidden sm:inline text-xs font-semibold text-blue-600 group-hover:underline">
                     입장
                   </span>
-                  <button
-                    onClick={(e) => handleRemoveFromList(e, room.id)}
-                    title="목록에서 삭제"
-                    className="p-2 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition"
-                  >
-                    <Trash2 size={18} />
-                  </button>
+                  {!isMaster && (
+                    <button
+                      onClick={(e) => handleRemoveFromList(e, room.id)}
+                      title="목록에서 삭제"
+                      className="p-2 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition"
+                    >
+                      <Trash2 size={18} />
+                    </button>
+                  )}
                   <ArrowRight size={18} className="text-neutral-300 group-hover:text-blue-500 group-hover:translate-x-0.5 transition" />
                 </div>
               </div>
@@ -300,8 +355,8 @@ export default function HomePage() {
           )}
         </div>
 
-        {/* 새 대화방 만들기 모달창 */}
-        {showCreateModal && (
+        {/* 새 대화방 만들기 모달창 (마스터 계정만) */}
+        {isMaster && showCreateModal && (
           <div className="fixed inset-0 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in duration-100">
             <div className="w-full max-w-sm bg-white rounded-3xl p-6 shadow-2xl border border-neutral-200">
               <h2 className="font-bold text-base text-neutral-900 mb-1 text-center">새 대화방 만들기</h2>
