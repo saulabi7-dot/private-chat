@@ -70,7 +70,13 @@ export default function RoomPage() {
   const [imageQuality, setImageQuality] = useState('compressed'); // 'compressed' | 'original'
   const [isCompressing, setIsCompressing] = useState(false);
 
-  const scrollRef = useRef(null);
+  // 메시지 목록 스크롤 컨테이너 자체에 대한 ref. 예전엔 맨 아래 빈 sentinel div에
+  // scrollIntoView()를 호출했는데, scrollIntoView는 기본적으로 이 요소를 보이게
+  // 하기 위해 필요한 모든 조상 스크롤 컨테이너(문서 전체 포함)를 함께 움직일 수
+  // 있어서, 메시지를 보낸 뒤 화면(카드) 전체가 아래로 밀려 헤더가 잘려 보이는
+  // 문제가 있었다. 컨테이너의 scrollTop만 직접 옮기면 이 컨테이너 안에서만
+  // 스크롤되고 페이지 자체는 절대 움직이지 않는다.
+  const messagesContainerRef = useRef(null);
   const fileRef = useRef(null);
 
   const formatTime = (iso) => {
@@ -134,17 +140,22 @@ export default function RoomPage() {
             if (error) console.error('[room] room_members 동기화 실패:', error.message);
           });
 
-        if (sessionStorage.getItem(`unlocked_${roomId}`) === 'true' || !data.password) {
+        // localStorage 사용: sessionStorage는 브라우징 컨텍스트(탭)별로 분리되어
+        // 있어서, 알림을 눌러 열리는 새 창(sw.js의 clients.openWindow)은 매번
+        // 빈 세션으로 시작한다 — 비밀번호를 풀고 닉네임을 정해도 다음번에 알림을
+        // 눌러 들어오면 또 처음부터 물어보던 게 이 때문이었다. localStorage는
+        // 같은 기기·브라우저 안에서 탭/창에 상관없이 공유되므로 한 번만 하면 된다.
+        if (localStorage.getItem(`unlocked_${roomId}`) === 'true' || !data.password) {
           setIsUnlocked(true);
         }
-        const savedNick = sessionStorage.getItem(`nick_${roomId}`);
+        const savedNick = localStorage.getItem(`nick_${roomId}`);
         if (savedNick) { setNickname(savedNick); setIsJoined(true); }
       }
       setLoading(false);
     });
   }, [roomId, session]);
 
-  // 닉네임이 정해지면(직접 입력했거나 sessionStorage에 저장된 게 있어서
+  // 닉네임이 정해지면(직접 입력했거나 localStorage에 저장된 게 있어서
   // 자동으로 입장한 경우 모두) room_members에도 닉네임을 갱신해 둔다.
   // 참여자 목록 화면이 "닉네임 미설정" 대신 실제 닉네임을 보여줄 수 있으려면
   // 서버(room_members)에 닉네임이 저장되어 있어야 한다.
@@ -245,7 +256,8 @@ export default function RoomPage() {
 
   useEffect(() => {
     if (!isSelectMode && !editingId && !pendingImages) {
-      scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
+      const el = messagesContainerRef.current;
+      if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
     }
   }, [messages, isSelectMode, editingId, pendingImages]);
 
@@ -318,7 +330,7 @@ export default function RoomPage() {
   const handleUnlock = (e) => {
     e.preventDefault();
     if (passwordInput === room.password) {
-      sessionStorage.setItem(`unlocked_${roomId}`, 'true');
+      localStorage.setItem(`unlocked_${roomId}`, 'true');
       setIsUnlocked(true);
     } else {
       alert('비밀번호가 올바르지 않습니다.');
@@ -460,7 +472,7 @@ export default function RoomPage() {
   const join = (e) => {
     e.preventDefault();
     if (!nickname.trim()) return;
-    sessionStorage.setItem(`nick_${roomId}`, nickname.trim());
+    localStorage.setItem(`nick_${roomId}`, nickname.trim());
     setIsJoined(true);
   };
 
@@ -664,7 +676,8 @@ export default function RoomPage() {
       )}
 
       {/* 대화 메시지 영역 */}
-      <div 
+      <div
+        ref={messagesContainerRef}
         onClick={() => setShowMenu(false)}
         className="flex-1 overflow-y-auto p-4 space-y-3.5"
       >
@@ -809,7 +822,6 @@ export default function RoomPage() {
             );
           })
         )}
-        <div ref={scrollRef} />
       </div>
 
       {/* 내 프로필 사진 변경 모달 */}

@@ -131,7 +131,10 @@ export default function HomePage() {
       return;
     }
 
-    sessionStorage.setItem(`unlocked_${shortCode}`, 'true');
+    // sessionStorage는 탭/브라우징 컨텍스트별로 분리되어 있어서, 알림을 눌러 열리는
+    // 새 창(clients.openWindow)은 항상 빈 세션으로 시작해 비밀번호/닉네임을 잊어버린다.
+    // localStorage로 저장해 같은 기기·브라우저에서는 한 번만 입력하면 되게 한다.
+    localStorage.setItem(`unlocked_${shortCode}`, 'true');
 
     await supabase.from('room_members').insert([{ room_id: data.id, user_id: session.user.id }]);
 
