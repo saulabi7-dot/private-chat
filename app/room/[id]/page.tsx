@@ -5,16 +5,17 @@ import { useParams, useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import { useSession } from '@/lib/useSession';
 import { isPushSupported, subscribeToPush, unsubscribeFromPush, getCurrentSubscription } from '@/lib/push';
-import { resizeImageFile } from '@/lib/compressImage';
+import { readImageFileAsDataUrl, resizeImageFile } from '@/lib/compressImage';
 import { downloadDataUrl, filenameFor } from '@/lib/download';
 import AuthForm from '@/components/AuthForm';
 import AvatarModal from '@/components/AvatarModal';
 import MemberListModal from '@/components/MemberListModal';
 import PhotoGalleryModal from '@/components/PhotoGalleryModal';
+import ZoomableImage from '@/components/ZoomableImage';
 import {
   ChevronLeft, MoreVertical, Copy, Trash2, Send,
   Smile, Image as ImgIcon, Lock, X, Edit2, CheckSquare, Square,
-  Zap, Sparkles, UserCircle2, Bell, BellOff, Users, Images, Download
+  UserCircle2, Bell, BellOff, Users, Images, Download, Settings2
 } from 'lucide-react';
 
 const PACKS = [
@@ -22,25 +23,64 @@ const PACKS = [
   { id: 'boy', name: '👦 남자', src: '/stickers/boy.png' },
   { id: 'girl', name: '👧 여자', src: '/stickers/girl.png' },
 ];
+const STICKER_PREFIX = 'data:image/png;sticker,';
+const IMAGE_PREFIX = 'data:image/';
 
-// 스티커 시트(2열×5행, 칸마다 캡션 글자 + 그림) 한 장을 낱개 이모티콘 10개로
-// 잘라낸다. 예전엔 시트를 무조건 균등하게 2x5로 나눴는데, 두 가지 문제가 있었다:
-// 1) 가로/세로를 각각 따로 360px로 clamp해서 실제로는 가로세로 비율이 다르게
-//    늘어나 있었다(예: 가로만 줄고 세로는 그대로 → 세로로 눌린 것처럼 보임).
-// 2) 실제 시트는 칸마다 캡션+그림 높이가 미세하게 달라서, 정확히 5등분한
-//    경계선이 캡션 글자를 위/아래로 자르거나 옆 칸 글자를 섞어 넣었다.
-// 알파 채널을 읽어서 실제 그림이 있는 세로 영역(밴드)을 열(column)별로 찾아
-// 그 경계로 자르고, 가로/세로를 같은 비율로만 축소해서 비율이 틀어지지 않게
-// 한다. 밴드를 정확히 5개(행 수) 찾지 못하면(시트 형식이 다르거나 감지 실패)
-// 기존 균등분할로 폴백해서 항상 동작은 보장한다.
-function sliceStickerSheet(img) {
+function isStickerContent(content) {
+  if (typeof content !== 'string') return false;
+  // 새 메시지는 명시적인 접두사로 판별한다. 접두사 추가 전의 기존 스티커는 모두
+  // 작은 PNG data URL이므로 크기 기준을 폴백으로 남겨 과거 대화도 그대로 보인다.
+  return content.startsWith(STICKER_PREFIX) || (content.startsWith('data:image/png') && content.length < 900_000);
+}
+
+function stickerImageUrl(content) {
+  return content.startsWith(STICKER_PREFIX)
+    ? `data:image/png;base64,${content.slice(STICKER_PREFIX.length)}`
+    : content;
+}
+
+function encodeStickerContent(dataUrl) {
+  const comma = dataUrl.indexOf(',');
+  return comma === -1 ? dataUrl : `${STICKER_PREFIX}${dataUrl.slice(comma + 1)}`;
+}
+
+// 스티커 시트(2열×5행)를 낱개 이모티콘 10개로 잘라낸다. 세 팩의 실제
+// 행 경계는 균등하지 않고 팩마다 조금씩 다르다. 특히 boy/girl 시트는 행 사이의
+// 그림이 이어져 있어 알파 채널 자동 감지로는 경계를 찾을 수 없다. 원본 시트를
+// 픽셀 단위로 확인해 얻은 팩별 경계를 비율로 저장하고, 각 열 안의 큰 좌우 여백도
+// 함께 잘라 실제 그림과 캡션이 선택창/메시지에서 크고 선명하게 보이도록 한다.
+const STICKER_CROP = {
+  couple: {
+    rows: [
+      [0, 0.2052, 0.4004, 0.5915, 0.7827, 1],
+      [0, 0.2052, 0.3991, 0.5936, 0.7827, 1],
+    ],
+    cols: [[0.26, 0.99], [0.02, 0.81]],
+  },
+  boy: {
+    rows: [
+      [0, 0.2072, 0.4125, 0.6063, 0.7988, 1],
+      [0, 0.2086, 0.4131, 0.6076, 0.7981, 1],
+    ],
+    cols: [[0.35, 0.99], [0.04, 0.75]],
+  },
+  girl: {
+    rows: [
+      [0, 0.2079, 0.4138, 0.6030, 0.7907, 1],
+      [0, 0.2079, 0.4131, 0.6030, 0.7914, 1],
+    ],
+    cols: [[0.35, 1], [0.01, 0.76]],
+  },
+};
+
+function sliceStickerSheet(img, packId) {
   const width = img.naturalWidth;
   const height = img.naturalHeight;
   const cols = 2;
   const rows = 5;
+  const MAX_SIDE = 440;
+  const crop = STICKER_CROP[packId] || STICKER_CROP.couple;
   const cellW = width / cols;
-  const cellH = height / rows;
-  const MAX_SIDE = 360;
 
   const drawScaled = (sx, sy, sw, sh) => {
     const scale = Math.min(1, MAX_SIDE / Math.max(sw, sh));
@@ -48,80 +88,25 @@ function sliceStickerSheet(img) {
     canvas.width = Math.max(1, Math.round(sw * scale));
     canvas.height = Math.max(1, Math.round(sh * scale));
     const ctx = canvas.getContext('2d');
+    if (!ctx) return '';
     ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
     return canvas.toDataURL('image/png');
   };
 
-  const fallback = () => {
-    const list = [];
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        list.push(drawScaled(c * cellW, r * cellH, cellW, cellH));
-      }
-    }
-    return list;
-  };
-
-  try {
-    const full = document.createElement('canvas');
-    full.width = width;
-    full.height = height;
-    const fullCtx = full.getContext('2d');
-    fullCtx.drawImage(img, 0, 0);
-    const { data } = fullCtx.getImageData(0, 0, width, height);
-    const alphaAt = (x, y) => data[(y * width + x) * 4 + 3];
-
-    const columnBands = [];
+  const list = [];
+  for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
-      const xStart = Math.round(c * cellW);
-      const xEnd = Math.round((c + 1) * cellW);
-      const rowHasContent = new Array(height).fill(false);
-      for (let y = 0; y < height; y++) {
-        let hits = 0;
-        for (let x = xStart; x < xEnd; x += 3) {
-          if (alphaAt(x, y) > 20 && ++hits > 3) break;
-        }
-        rowHasContent[y] = hits > 3;
-      }
-
-      const rawBands = [];
-      let start = -1;
-      for (let y = 0; y < height; y++) {
-        if (rowHasContent[y] && start === -1) start = y;
-        else if (!rowHasContent[y] && start !== -1) { rawBands.push([start, y]); start = -1; }
-      }
-      if (start !== -1) rawBands.push([start, height]);
-
-      // 노이즈(더듬이/장식 사이 좁은 틈 등)로 갈라진 작은 틈은 같은 칸으로 합친다.
-      const merged = [];
-      for (const band of rawBands) {
-        const prev = merged[merged.length - 1];
-        if (prev && band[0] - prev[1] < 10) prev[1] = band[1];
-        else merged.push([...band]);
-      }
-      columnBands.push(merged);
+      const rowBoundaries = crop.rows[c];
+      const top = Math.round(height * rowBoundaries[r]);
+      const bottom = Math.round(height * rowBoundaries[r + 1]);
+      const columnStart = c * cellW;
+      const [leftRatio, rightRatio] = crop.cols[c];
+      const left = Math.round(columnStart + cellW * leftRatio);
+      const right = Math.round(columnStart + cellW * rightRatio);
+      list.push(drawScaled(left, top, right - left, bottom - top));
     }
-
-    if (columnBands.some((bands) => bands.length !== rows)) {
-      return fallback();
-    }
-
-    const pad = 8;
-    const list = [];
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const xStart = Math.round(c * cellW);
-        const xEnd = Math.round((c + 1) * cellW);
-        const [rawTop, rawBottom] = columnBands[c][r];
-        const top = Math.max(0, rawTop - pad);
-        const bottom = Math.min(height, rawBottom + pad);
-        list.push(drawScaled(xStart, top, xEnd - xStart, bottom - top));
-      }
-    }
-    return list;
-  } catch (e) {
-    return fallback();
   }
+  return list;
 }
 
 // 키보드에 있는 기본(유니코드) 이모지를 1~3개만 단독으로 보낸 메시지는 말풍선
@@ -187,6 +172,8 @@ export default function RoomPage() {
   // 탭해도 아무 반응이 없었다 — 그래서 같은 화면 안에서 확대 + 다운로드 버튼을
   // 보여주는 방식으로 바꾼다(사진첩의 라이트박스와 동일한 패턴).
   const [lightboxMsg, setLightboxMsg] = useState(null);
+  // 상대방 프로필 사진(아바타)을 탭했을 때 확대해서 보여주는 뷰어에 쓰는 이미지 URL
+  const [avatarViewerUrl, setAvatarViewerUrl] = useState(null);
 
   // 수정 및 선택 삭제
   const [editingId, setEditingId] = useState(null);
@@ -194,9 +181,19 @@ export default function RoomPage() {
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState([]);
 
-  // 사진 전송 모달 (화질 선택) — 여러 장을 한 번에 선택할 수 있도록 배열로 관리
+  // 사진은 파일 선택 또는 클립보드 붙여넣기로 추가한 뒤 미리보기에서 확인한다.
+  // 화질 모드는 매번 묻지 않고 설정 메뉴에서 한 번 정해 localStorage에 보관한다.
   const [pendingImages, setPendingImages] = useState(null); // [{ file, previewUrl }] | null
-  const [imageQuality, setImageQuality] = useState('compressed'); // 'compressed' | 'original'
+  const [imageQuality, setImageQuality] = useState(() => {
+    if (typeof window === 'undefined') return 'high';
+    try {
+      const savedQuality = localStorage.getItem('image_quality');
+      return ['low', 'high', 'original'].includes(savedQuality) ? savedQuality : 'high';
+    } catch {
+      return 'high';
+    }
+  }); // 'low' | 'high' | 'original'
+  const [showImageQualitySettings, setShowImageQualitySettings] = useState(false);
   const [isCompressing, setIsCompressing] = useState(false);
 
   // 메시지 목록 스크롤 컨테이너 자체에 대한 ref. 예전엔 맨 아래 빈 sentinel div에
@@ -239,7 +236,7 @@ export default function RoomPage() {
     PACKS.forEach((pack) => {
       const img = new Image();
       img.onload = () => {
-        setStickers((prev) => ({ ...prev, [pack.id]: sliceStickerSheet(img) }));
+        setStickers((prev) => ({ ...prev, [pack.id]: sliceStickerSheet(img, pack.id) }));
       };
       img.onerror = () => {};
       img.src = pack.src;
@@ -446,16 +443,39 @@ export default function RoomPage() {
     const el = viewportWrapRef.current;
     if (!vv || !el) return;
 
+    let frame = 0;
+    let lastHeight = 0;
+    let lastOffsetTop = -1;
     const sync = () => {
-      el.style.height = `${vv.height}px`;
-      el.style.transform = vv.offsetTop ? `translateY(${vv.offsetTop}px)` : '';
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        // 키보드 애니메이션 중 resize/scroll 이벤트가 같은 프레임에 연달아 오면서
+        // 서로 다른 중간값으로 두 번 그려지던 것이 한 번 깜빡이는 원인이었다.
+        // 프레임당 마지막 값만 반영하고, 실제 값이 달라질 때만 스타일을 바꾼다.
+        const height = Math.round(vv.height);
+        const offsetTop = Math.round(vv.offsetTop);
+        if (height !== lastHeight) {
+          el.style.height = `${height}px`;
+          lastHeight = height;
+        }
+        if (offsetTop !== lastOffsetTop) {
+          el.style.transform = offsetTop ? `translate3d(0, ${offsetTop}px, 0)` : '';
+          lastOffsetTop = offsetTop;
+        }
+      });
     };
 
-    sync();
+    // 첫 페인트 전에 현재 visual viewport 크기를 즉시 적용해 CSS의 100dvh 값과
+    // JS 보정 높이가 한 프레임 동안 번갈아 보이지 않게 한다.
+    el.style.height = `${Math.round(vv.height)}px`;
+    lastHeight = Math.round(vv.height);
+    lastOffsetTop = Math.round(vv.offsetTop);
+    el.style.transform = lastOffsetTop ? `translate3d(0, ${lastOffsetTop}px, 0)` : '';
     vv.addEventListener('resize', sync);
     vv.addEventListener('scroll', sync);
 
     return () => {
+      cancelAnimationFrame(frame);
       vv.removeEventListener('resize', sync);
       vv.removeEventListener('scroll', sync);
       el.style.height = '';
@@ -471,11 +491,29 @@ export default function RoomPage() {
     });
   }, [session]);
 
-  // 이 기기에 이미 켜져 있는 알림 구독이 있는지 확인해서 방울 아이콘 초기 상태를 맞춘다.
+  // 이 브라우저의 권한과 현재 push 구독을 모두 확인한다. 예전에는 브라우저에
+  // subscription 객체만 남아 있으면 서버 DB에 실제로 등록돼 있지 않아도 켜짐으로
+  // 표시되어, 특히 PC에서 방울은 켜져 있는데 알림은 안 오는 상태가 생길 수 있었다.
+  // 권한이 허용된 기존 구독은 로그인할 때마다 서버에 다시 upsert해 자동 복구한다.
   useEffect(() => {
     if (!session) return;
-    if (!isPushSupported()) { setNotifEnabled(false); return; }
-    getCurrentSubscription().then((sub) => setNotifEnabled(!!sub));
+    if (!isPushSupported()) {
+      Promise.resolve().then(() => setNotifEnabled(false));
+      return;
+    }
+
+    getCurrentSubscription().then(async (sub) => {
+      if (sub && Notification.permission === 'granted') {
+        try {
+          await subscribeToPush(session.user.id, { requestPermission: false });
+          setNotifEnabled(true);
+          return;
+        } catch (err) {
+          console.error('[push] 기존 구독 서버 동기화 실패:', err);
+        }
+      }
+      setNotifEnabled(false);
+    });
   }, [session]);
 
   const handleToggleNotif = async () => {
@@ -500,33 +538,46 @@ export default function RoomPage() {
     }
   };
 
-  // 메시지 전송 성공 후 같은 방의 다른 멤버들에게 보낼 알림 미리보기 텍스트를 만들어
-  // /api/notify로 fire-and-forget 발송한다 (실패해도 채팅 자체엔 영향 없음).
-  const notifyNewMessage = (content) => {
+  // 메시지 전송 성공 후 같은 방 멤버들의 다른 기기로 보낼 알림을 fire-and-forget
+  // 발송한다. 현재 브라우저의 endpoint를 함께 보내 이 기기에 자기 메시지 알림이
+  // 되돌아오는 건 막되, 같은 계정으로 로그인한 PC/폰에는 알림이 가도록 한다.
+  const postNotification = async (body) => {
     if (!session?.access_token) return;
-    const isImg = content?.startsWith('data:image/jpeg');
-    const isSticker = content?.startsWith('data:image/png');
+
+    let senderEndpoint;
+    try {
+      senderEndpoint = (await getCurrentSubscription())?.endpoint;
+    } catch {
+      // 로컬 구독 확인 실패가 다른 기기의 알림 발송까지 막으면 안 된다.
+    }
+
+    fetch('/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
+      body: JSON.stringify({
+        roomId,
+        title: room?.title || '새 메시지',
+        body,
+        senderEndpoint,
+      }),
+    }).catch(() => {});
+  };
+
+  const notifyNewMessage = (content) => {
+    const isSticker = isStickerContent(content);
+    const isImg = typeof content === 'string' && content.startsWith(IMAGE_PREFIX) && !isSticker;
     let preview;
     if (isImg) preview = '사진을 보냈습니다';
     else if (isSticker) preview = '이모티콘을 보냈습니다';
     else preview = content.length > 40 ? content.slice(0, 40) + '…' : content;
 
-    fetch('/api/notify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
-      body: JSON.stringify({ roomId, title: room?.title || '새 메시지', body: `${nickname}: ${preview}` }),
-    }).catch(() => {});
+    void postNotification(`${nickname}: ${preview}`);
   };
 
   // 여러 장을 한 번에 보냈을 때는 "사진 N장을 보냈습니다"로 알림을 한 번만
   // 보낸다 (notifyNewMessage를 사진 수만큼 반복 호출하면 알림이 그만큼 따로 울림).
   const notifyPhotos = (count) => {
-    if (!session?.access_token) return;
-    fetch('/api/notify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
-      body: JSON.stringify({ roomId, title: room?.title || '새 메시지', body: `${nickname}: 사진 ${count}장을 보냈습니다` }),
-    }).catch(() => {});
+    void postNotification(`${nickname}: 사진 ${count}장을 보냈습니다`);
   };
 
   const handleUnlock = (e) => {
@@ -634,31 +685,48 @@ export default function RoomPage() {
     }
   };
 
-  // 사진 선택 시 미리보기 모달 띄우기 (여러 장 동시 선택 지원)
-  const handleImageFileSelect = (e) => {
-    const files = Array.from(e.target.files || []).filter((f) => f.type.startsWith('image/'));
-    e.target.value = '';
+  const openImagePreview = (fileList) => {
+    const files = Array.from(fileList || []).filter((file) => file.type.startsWith('image/'));
     if (files.length === 0) return;
-
+    setShowEmojiPicker(false);
     setPendingImages(files.map((file) => ({ file, previewUrl: URL.createObjectURL(file) })));
   };
 
-  // 선택한 화질(일반/원본)로 최종 전송. 여러 장이면 각각 순차적으로 리사이즈한
-  // 뒤 한 번에 sendMany로 보내고, 한 장이면 기존과 동일하게 send를 그대로 쓴다.
+  // 파일 선택과 클립보드 붙여넣기 모두 같은 미리보기/전송 흐름으로 보낸다.
+  const handleImageFileSelect = (e) => {
+    openImagePreview(e.target.files);
+    e.target.value = '';
+  };
+
+  const handlePaste = (e) => {
+    const imageFiles = Array.from(e.clipboardData?.items || [])
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (imageFiles.length === 0) return;
+    e.preventDefault();
+    openImagePreview(imageFiles);
+  };
+
+  // 설정에 저장한 화질로 전송한다. 원본은 파일을 다시 인코딩하지 않고 그대로 data
+  // URL로 읽어서 픽셀/품질을 보존하고, 저화질/고화질만 목표 용량에 맞춰 압축한다.
   const handleConfirmSendImage = async () => {
     if (!pendingImages || pendingImages.length === 0) return;
     setIsCompressing(true);
 
-    // 일반(축소): 720px / 0.6 품질 (초고속, 약 35KB)
-    // 원본(고화질): 1920px (Full HD) / 0.85 품질 (선명한 고화질)
-    const isOrig = imageQuality === 'original';
-    const maxDim = isOrig ? 1920 : 720;
-    const quality = isOrig ? 0.85 : 0.6;
+    const qualityOptions = {
+      low: { maxBytes: 100 * 1024, maxDim: 1280, quality: 0.72 },
+      high: { maxBytes: 800 * 1024, maxDim: 2560, quality: 0.9 },
+    };
 
     try {
       const contents = [];
       for (const { file } of pendingImages) {
-        contents.push(await resizeImageFile(file, { maxDim, quality }));
+        contents.push(
+          imageQuality === 'original'
+            ? await readImageFileAsDataUrl(file)
+            : await resizeImageFile(file, qualityOptions[imageQuality] || qualityOptions.high)
+        );
       }
       if (contents.length === 1) {
         await send(contents[0]);
@@ -830,6 +898,17 @@ export default function RoomPage() {
                 <span>사진첩</span>
               </button>
 
+              <button
+                onClick={() => {
+                  setShowImageQualitySettings(true);
+                  setShowMenu(false);
+                }}
+                className="w-full flex items-center space-x-2.5 px-3.5 py-2.5 text-xs text-neutral-700 hover:bg-neutral-50 transition"
+              >
+                <Settings2 size={15} className="text-blue-600" />
+                <span>사진 화질 설정</span>
+              </button>
+
               <div className="h-[1px] bg-neutral-100 my-1"></div>
 
               <button
@@ -900,7 +979,7 @@ export default function RoomPage() {
       <div
         ref={messagesContainerRef}
         onClick={() => setShowMenu(false)}
-        className="flex-1 overflow-y-auto p-4 space-y-3.5"
+        className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden px-2.5 sm:px-4 py-3 space-y-3"
       >
         <div className="flex justify-center my-2">
           <span className="px-3 py-1 bg-black/15 text-white/90 text-[11px] font-medium rounded-full shadow-xs">
@@ -921,8 +1000,8 @@ export default function RoomPage() {
             // 동일)로 판정하도록 고쳐서 닉네임이 달라도 항상 내 메시지로 인식되게
             // 한다. user_id가 없는(컬럼 추가 이전) 옛 메시지만 닉네임 비교로 대체.
             const isMe = msg.user_id ? msg.user_id === session.user.id : msg.sender === nickname;
-            const isImg = msg.content?.startsWith('data:image/jpeg');
-            const isSticker = msg.content?.startsWith('data:image/png');
+            const isSticker = isStickerContent(msg.content);
+            const isImg = typeof msg.content === 'string' && msg.content.startsWith(IMAGE_PREFIX) && !isSticker;
             // 키보드 기본 이모지를 1~3개만 단독으로 보낸 경우 말풍선 없이 크게
             // 보여주기 위한 개수(1~3) 판별. 사진/스티커는 대상이 아니다.
             const emojiOnlyCount = !isImg && !isSticker ? getEmojiOnlyCount(msg.content) : null;
@@ -931,7 +1010,7 @@ export default function RoomPage() {
             return (
               <div 
                 key={msg.id} 
-                className={`flex ${isMe ? 'justify-end' : 'justify-start'} items-end space-x-1.5 group relative`}
+                className={`flex w-full ${isMe ? 'justify-end' : 'justify-start'} items-end gap-1.5 group relative`}
               >
                 {isSelectMode && (
                   <button
@@ -947,7 +1026,10 @@ export default function RoomPage() {
                 )}
 
                 {!isMe && (
-                  <div className="w-8 h-8 rounded-full bg-white shadow-xs border border-neutral-200 flex items-center justify-center text-xs font-bold text-neutral-600 shrink-0 self-start mt-0.5 overflow-hidden">
+                  <div
+                    onClick={() => profiles[msg.user_id] && setAvatarViewerUrl(profiles[msg.user_id])}
+                    className={`w-8 h-8 rounded-full bg-white shadow-xs border border-neutral-200 flex items-center justify-center text-xs font-bold text-neutral-600 shrink-0 self-start mt-0.5 overflow-hidden ${profiles[msg.user_id] ? 'cursor-pointer' : ''}`}
+                  >
                     {profiles[msg.user_id] ? (
                       <img src={profiles[msg.user_id]} alt={msg.sender} className="w-full h-full object-cover" />
                     ) : (
@@ -983,7 +1065,7 @@ export default function RoomPage() {
                   </span>
                 )}
 
-                <div className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
+                <div className={`flex min-w-0 max-w-[82%] sm:max-w-[78%] flex-col ${isMe ? 'items-end' : 'items-start'}`}>
                   {!isMe && (
                     <span className="text-[11px] font-semibold text-neutral-600 mb-1 ml-1">
                       {msg.sender}
@@ -1019,7 +1101,7 @@ export default function RoomPage() {
                     </div>
                   ) : isSticker ? (
                     <div className="p-0.5 hover:scale-105 transition-transform duration-150">
-                      <img src={msg.content} alt="이모티콘" className="w-28 h-28 object-contain drop-shadow-sm" />
+                      <img src={stickerImageUrl(msg.content)} alt="이모티콘" className="w-40 h-40 sm:w-44 sm:h-44 object-contain drop-shadow-sm" />
                     </div>
                   ) : isImg ? (
                     <div className="rounded-2xl overflow-hidden shadow-md border border-black/5 bg-white p-1">
@@ -1039,7 +1121,7 @@ export default function RoomPage() {
                     </div>
                   ) : (
                     <div
-                      className={`px-3.5 py-2 rounded-2xl text-[13px] leading-relaxed shadow-xs max-w-[320px] sm:max-w-[420px] break-words ${
+                      className={`px-3.5 py-2 rounded-2xl text-[13px] leading-relaxed shadow-xs max-w-full break-words ${
                         isMe
                           ? 'bg-blue-600 text-white rounded-br-xs font-normal'
                           : 'bg-white text-neutral-800 rounded-bl-xs border border-neutral-200/80'
@@ -1109,24 +1191,94 @@ export default function RoomPage() {
               </button>
             </div>
           </div>
-          <div className="flex-1 flex items-center justify-center px-2" onClick={() => setLightboxMsg(null)}>
-            <img
-              src={lightboxMsg.content}
-              alt="사진"
-              className="max-h-full max-w-full object-contain"
-              onClick={(e) => e.stopPropagation()}
-            />
+          <ZoomableImage
+            src={lightboxMsg.content}
+            alt="사진"
+            className="max-h-full max-w-full object-contain"
+            containerClassName="flex-1 flex items-center justify-center px-2 w-full h-full"
+            onTap={() => setLightboxMsg(null)}
+          />
+        </div>
+      )}
+
+      {/* 프로필 사진 확대보기 라이트박스 (핀치줌/더블탭 확대 가능) */}
+      {avatarViewerUrl && (
+        <div className="fixed inset-0 bg-black/90 flex flex-col z-[60] animate-in fade-in duration-100">
+          <div className="flex items-center justify-end px-4 py-3 shrink-0">
+            <button onClick={() => setAvatarViewerUrl(null)} className="p-2 text-white/90 hover:bg-white/10 rounded-full transition">
+              <X size={20} />
+            </button>
+          </div>
+          <ZoomableImage
+            src={avatarViewerUrl}
+            alt="프로필 사진"
+            className="max-h-full max-w-full object-contain rounded-2xl"
+            containerClassName="flex-1 flex items-center justify-center px-4 pb-4 w-full h-full"
+            onTap={() => setAvatarViewerUrl(null)}
+          />
+        </div>
+      )}
+
+      {/* 사진 화질은 메시지를 보낼 때마다 묻지 않고 여기서 한 번 설정한다. */}
+      {showImageQualitySettings && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+          <div className="w-full max-w-sm bg-white rounded-3xl p-5 shadow-2xl border border-neutral-200">
+            <div className="flex items-center justify-between mb-1">
+              <h3 className="font-bold text-sm text-neutral-900">사진 전송 화질</h3>
+              <button
+                type="button"
+                onClick={() => setShowImageQualitySettings(false)}
+                className="p-1.5 text-neutral-400 hover:bg-neutral-100 rounded-full"
+                title="닫기"
+              >
+                <X size={17} />
+              </button>
+            </div>
+            <p className="text-[11px] text-neutral-400 mb-4">선택한 설정은 이 브라우저에 저장되어 다음 사진에도 계속 적용됩니다.</p>
+            <div className="space-y-2">
+              {[
+                { id: 'low', title: '저화질', description: '사진당 약 100KB · 빠른 전송' },
+                { id: 'high', title: '고화질', description: '사진당 약 800KB · 선명한 화질' },
+                { id: 'original', title: '원본', description: '압축 없이 원본 파일 그대로' },
+              ].map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => {
+                    setImageQuality(option.id);
+                    try { localStorage.setItem('image_quality', option.id); } catch {}
+                    setShowImageQualitySettings(false);
+                  }}
+                  className={`w-full flex items-center justify-between px-4 py-3 rounded-2xl border text-left transition ${
+                    imageQuality === option.id
+                      ? 'border-blue-500 bg-blue-50 text-blue-700'
+                      : 'border-neutral-200 hover:bg-neutral-50 text-neutral-700'
+                  }`}
+                >
+                  <span>
+                    <span className="block text-xs font-bold">{option.title}</span>
+                    <span className="block text-[10px] mt-0.5 opacity-70">{option.description}</span>
+                  </span>
+                  <span className={`w-4 h-4 rounded-full border-4 ${imageQuality === option.id ? 'border-blue-600' : 'border-neutral-300'}`} />
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       )}
 
-      {/* 사진 전송 전 화질 선택 모달 (카카오톡 스타일, 여러 장 동시 선택 지원) */}
+      {/* 파일 선택/붙여넣기로 추가한 사진을 전송 전에 확인한다. */}
       {pendingImages && pendingImages.length > 0 && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in duration-100">
           <div className="w-full max-w-sm bg-white rounded-3xl p-5 shadow-2xl border border-neutral-200 space-y-4">
-            <h3 className="font-bold text-sm text-neutral-900 text-center">
-              사진 전송{pendingImages.length > 1 && ` (${pendingImages.length}장 선택됨)`}
-            </h3>
+            <div className="text-center">
+              <h3 className="font-bold text-sm text-neutral-900">
+                사진 전송{pendingImages.length > 1 && ` (${pendingImages.length}장 선택됨)`}
+              </h3>
+              <p className="text-[10px] text-neutral-400 mt-1">
+                현재 화질: {imageQuality === 'low' ? '저화질 · 약 100KB' : imageQuality === 'high' ? '고화질 · 약 800KB' : '원본'}
+              </p>
+            </div>
 
             {/* 사진 미리보기: 한 장이면 크게, 여러 장이면 가로 스크롤 썸네일 스트립 */}
             {pendingImages.length === 1 ? (
@@ -1145,41 +1297,6 @@ export default function RoomPage() {
                 ))}
               </div>
             )}
-
-            {/* 화질 선택 버튼 (일반 vs 원본) — 선택한 모든 장에 공통 적용 */}
-            <div className="grid grid-cols-2 gap-2 p-1 bg-neutral-100 rounded-2xl">
-              <button
-                type="button"
-                onClick={() => setImageQuality('compressed')}
-                className={`flex flex-col items-center py-2.5 px-2 rounded-xl text-xs transition ${
-                  imageQuality === 'compressed'
-                    ? 'bg-white text-blue-600 font-bold shadow-xs'
-                    : 'text-neutral-500 hover:text-neutral-800'
-                }`}
-              >
-                <div className="flex items-center space-x-1">
-                  <Zap size={14} />
-                  <span>일반 화질</span>
-                </div>
-                <span className="text-[10px] font-normal text-neutral-400 mt-0.5">용량 축소 / 빠른 전송</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setImageQuality('original')}
-                className={`flex flex-col items-center py-2.5 px-2 rounded-xl text-xs transition ${
-                  imageQuality === 'original'
-                    ? 'bg-white text-blue-600 font-bold shadow-xs'
-                    : 'text-neutral-500 hover:text-neutral-800'
-                }`}
-              >
-                <div className="flex items-center space-x-1">
-                  <Sparkles size={14} />
-                  <span>원본 / 고화질</span>
-                </div>
-                <span className="text-[10px] font-normal text-neutral-400 mt-0.5">선명한 원본 해상도</span>
-              </button>
-            </div>
 
             {/* 하단 취소 / 전송 버튼 */}
             <div className="flex space-x-2 pt-1">
@@ -1242,7 +1359,7 @@ export default function RoomPage() {
               </button>
             </div>
 
-            <div className="p-3 grid grid-cols-4 gap-2.5 max-h-72 overflow-y-auto">
+            <div className="grid grid-cols-3 sm:grid-cols-4 gap-1.5 p-2 max-h-[22rem] overflow-y-auto">
               {(stickers[activePack] || []).length === 0 ? (
                 <div className="col-span-4 text-center py-6 text-xs text-neutral-400">
                   이모티콘 파일을 불러오는 중입니다...
@@ -1252,10 +1369,10 @@ export default function RoomPage() {
                   <button
                     key={idx}
                     type="button"
-                    onClick={() => { send(stickerUrl); setShowEmojiPicker(false); }}
+                    onClick={() => { send(encodeStickerContent(stickerUrl)); setShowEmojiPicker(false); }}
                     className="p-1.5 hover:bg-neutral-100 active:scale-90 rounded-2xl transition flex items-center justify-center cursor-pointer"
                   >
-                    <img src={stickerUrl} alt="스티커" className="w-20 h-20 object-contain" />
+                    <img src={stickerUrl} alt="스티커" className="w-24 h-24 sm:w-28 sm:h-28 object-contain" />
                   </button>
                 ))
               )}
@@ -1294,6 +1411,7 @@ export default function RoomPage() {
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             className="flex-1 px-4 py-2 text-sm bg-neutral-100 rounded-2xl border border-transparent focus:border-blue-400 focus:bg-white focus:outline-none transition"
           />
 
