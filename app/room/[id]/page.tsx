@@ -210,6 +210,12 @@ export default function RoomPage() {
   // 메시지가 한꺼번에 채워질 때는 즉시 이동시키고, 이미 보고 있는 중에 새
   // 메시지가 도착했을 때만 부드럽게 스크롤한다(아래 스크롤 useEffect 참고).
   const hasScrolledOnceRef = useRef(false);
+  // 사용자가 지금 맨 아래(최신 메시지) 근처를 보고 있는지. 콘텐츠가 늘어나는
+  // 것만으로는 scroll 이벤트가 발생하지 않으므로(scrollTop은 그대로, scrollHeight만
+  // 커짐), 새 메시지가 도착하기 "직전" 사용자가 어디를 보고 있었는지가 그대로
+  // 유지된다 — 아래 스크롤 useEffect에서 이 값을 보고, 위로 스크롤해 지난 대화를
+  // 읽는 중이면 새 메시지가 와도 화면을 강제로 끌어내리지 않는다.
+  const isNearBottomRef = useRef(true);
   const fileRef = useRef(null);
   // "보내기" 버튼을 탭하면 포커스가 버튼으로 넘어가면서 모바일 키보드가 바로
   // 닫혀버리는 문제가 있어서, 버튼이 포커스를 가져가지 못하게 막고(mouseDown에서
@@ -409,7 +415,23 @@ export default function RoomPage() {
   // 혹시 같은 컴포넌트가 재사용되는 경우까지 대비한 방어 코드.
   useEffect(() => {
     hasScrolledOnceRef.current = false;
+    isNearBottomRef.current = true;
   }, [roomId]);
+
+  // isNearBottomRef를 최신 상태로 유지: 사용자가 손으로 스크롤하거나(위로 스크롤
+  // 해서 지난 대화 읽기), 아래 useEffect가 프로그램적으로 맨 아래로 스크롤할 때
+  // 모두 scroll 이벤트가 발생하므로 여기서 감지한다.
+  useEffect(() => {
+    if (!isJoined || !isUnlocked) return;
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    const NEAR_BOTTOM_PX = 120;
+    const handleScroll = () => {
+      isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+    };
+    el.addEventListener('scroll', handleScroll, { passive: true });
+    return () => el.removeEventListener('scroll', handleScroll);
+  }, [isJoined, isUnlocked]);
 
   useEffect(() => {
     if (isSelectMode || editingId || pendingImages || messages.length === 0) return;
@@ -419,15 +441,26 @@ export default function RoomPage() {
     // 방에 처음 들어와 서버에서 메시지가 한꺼번에 로드될 때 매번 맨 위부터
     // 맨 아래까지 smooth 스크롤이 재생되면, 대화가 길수록 시간이 오래 걸리고
     // 불필요하게 화면이 쭉 흘러내려가는 것처럼 보였다. 이 방에서 처음 스크롤할
-    // 때만 즉시(auto) 이동시키고, 이미 최신 메시지를 보고 있는 상태에서 새
-    // 메시지가 도착했을 때만 부드럽게(smooth) 스크롤한다.
+    // 때만 즉시(auto) 이동시킨다.
     if (!hasScrolledOnceRef.current) {
       el.scrollTo({ top: el.scrollHeight, behavior: 'auto' });
       hasScrolledOnceRef.current = true;
-    } else {
-      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+      isNearBottomRef.current = true;
+      return;
     }
-  }, [messages, isSelectMode, editingId, pendingImages]);
+
+    // 위로 스크롤해 지난 대화를 읽는 중일 때 상대가 보낸 새 메시지 때문에 화면이
+    // 강제로 맨 아래까지 끌려 내려가던 문제 수정: 이미 맨 아래 근처를 보고
+    // 있었거나(= 최신 메시지를 계속 따라가려는 의도), 방금 내가 보낸 메시지일
+    // 때만 부드럽게 따라 내려간다. 그 외(과거 메시지 읽는 중 + 남이 보낸 메시지)
+    // 에는 스크롤 위치를 그대로 둔다.
+    const lastMessage = messages[messages.length - 1];
+    const isOwnMessage = !!(lastMessage && session && lastMessage.user_id === session.user.id);
+    if (isNearBottomRef.current || isOwnMessage) {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+      isNearBottomRef.current = true;
+    }
+  }, [messages, isSelectMode, editingId, pendingImages, session]);
 
   // 키보드가 뜰 때 헤더가 화면 밖으로 밀리는 문제의 잔여 케이스 보정.
   // body/래퍼를 position:fixed + h-[100dvh]로 고정해도(globals.css, 아래 JSX 참고),
