@@ -6,6 +6,7 @@ import { supabase } from '@/lib/supabase';
 import { useSession } from '@/lib/useSession';
 import { isPushSupported, subscribeToPush, unsubscribeFromPush, getCurrentSubscription } from '@/lib/push';
 import { resizeImageFile } from '@/lib/compressImage';
+import { downloadDataUrl, filenameFor } from '@/lib/download';
 import AuthForm from '@/components/AuthForm';
 import AvatarModal from '@/components/AvatarModal';
 import MemberListModal from '@/components/MemberListModal';
@@ -13,7 +14,7 @@ import PhotoGalleryModal from '@/components/PhotoGalleryModal';
 import {
   ChevronLeft, MoreVertical, Copy, Trash2, Send,
   Smile, Image as ImgIcon, Lock, X, Edit2, CheckSquare, Square,
-  Zap, Sparkles, UserCircle2, Bell, BellOff, Users, Images
+  Zap, Sparkles, UserCircle2, Bell, BellOff, Users, Images, Download
 } from 'lucide-react';
 
 const PACKS = [
@@ -50,6 +51,13 @@ export default function RoomPage() {
   const [showMenu, setShowMenu] = useState(false);
   const [showMemberList, setShowMemberList] = useState(false);
   const [showPhotoGallery, setShowPhotoGallery] = useState(false);
+
+  // 채팅 말풍선의 사진을 탭했을 때 확대해서 보여주는 라이트박스.
+  // 예전엔 window.open(dataUrl)로 새 창을 띄웠는데, 대부분의 최신 브라우저가
+  // 보안상 이유로 data: URL로의 window.open 네비게이션을 조용히 차단해서
+  // 탭해도 아무 반응이 없었다 — 그래서 같은 화면 안에서 확대 + 다운로드 버튼을
+  // 보여주는 방식으로 바꾼다(사진첩의 라이트박스와 동일한 패턴).
+  const [lightboxMsg, setLightboxMsg] = useState(null);
 
   // 수정 및 선택 삭제
   const [editingId, setEditingId] = useState(null);
@@ -776,7 +784,7 @@ export default function RoomPage() {
                         src={msg.content}
                         alt="사진"
                         className="rounded-xl max-h-64 max-w-[280px] object-cover cursor-pointer hover:opacity-95"
-                        onClick={() => window.open(msg.content)}
+                        onClick={() => setLightboxMsg(msg)}
                       />
                     </div>
                   ) : (
@@ -829,6 +837,38 @@ export default function RoomPage() {
           messages={messages}
           onClose={() => setShowPhotoGallery(false)}
         />
+      )}
+
+      {/* 채팅 말풍선 사진 확대보기 + 다운로드 라이트박스 */}
+      {lightboxMsg && (
+        <div className="fixed inset-0 bg-black/90 flex flex-col z-[60] animate-in fade-in duration-100">
+          <div className="flex items-center justify-between px-4 py-3 text-white/90 shrink-0">
+            <div className="text-xs">
+              <p className="font-semibold">{formatDate(lightboxMsg.created_at)}</p>
+              <p className="text-white/60">{formatTime(lightboxMsg.created_at)}</p>
+            </div>
+            <div className="flex items-center space-x-1">
+              <button
+                onClick={() => downloadDataUrl(lightboxMsg.content, filenameFor(lightboxMsg.created_at))}
+                className="p-2 hover:bg-white/10 rounded-full transition"
+                title="사진 다운로드"
+              >
+                <Download size={19} />
+              </button>
+              <button onClick={() => setLightboxMsg(null)} className="p-2 hover:bg-white/10 rounded-full transition">
+                <X size={20} />
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 flex items-center justify-center px-2" onClick={() => setLightboxMsg(null)}>
+            <img
+              src={lightboxMsg.content}
+              alt="사진"
+              className="max-h-full max-w-full object-contain"
+              onClick={(e) => e.stopPropagation()}
+            />
+          </div>
+        </div>
       )}
 
       {/* 사진 전송 전 화질 선택 모달 (카카오톡 스타일, 여러 장 동시 선택 지원) */}

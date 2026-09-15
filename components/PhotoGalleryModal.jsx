@@ -5,7 +5,7 @@ import {
   X, ChevronLeft, ChevronRight, CheckSquare, Square,
   Download, FolderDown,
 } from 'lucide-react';
-import { downloadDataUrl, downloadMany, isDirectoryPickerSupported } from '@/lib/download';
+import { downloadDataUrl, downloadMany, isDirectoryPickerSupported, filenameFor } from '@/lib/download';
 
 function formatDate(iso) {
   if (!iso) return '';
@@ -21,13 +21,6 @@ function formatTime(iso) {
   const ampm = h >= 12 ? '오후' : '오전';
   h = h % 12 || 12;
   return `${ampm} ${h}:${m}`;
-}
-
-function filenameFor(iso, seq) {
-  const d = new Date(iso);
-  const pad = (n) => String(n).padStart(2, '0');
-  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-  return `사진_${stamp}_${String(seq).padStart(3, '0')}.jpg`;
 }
 
 // "..." 메뉴 → "사진첩"에서 여는 모달. 이미 방 페이지가 들고 있는 messages를
