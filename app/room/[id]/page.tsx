@@ -23,6 +23,135 @@ const PACKS = [
   { id: 'girl', name: '👧 여자', src: '/stickers/girl.png' },
 ];
 
+// 스티커 시트(2열×5행, 칸마다 캡션 글자 + 그림) 한 장을 낱개 이모티콘 10개로
+// 잘라낸다. 예전엔 시트를 무조건 균등하게 2x5로 나눴는데, 두 가지 문제가 있었다:
+// 1) 가로/세로를 각각 따로 360px로 clamp해서 실제로는 가로세로 비율이 다르게
+//    늘어나 있었다(예: 가로만 줄고 세로는 그대로 → 세로로 눌린 것처럼 보임).
+// 2) 실제 시트는 칸마다 캡션+그림 높이가 미세하게 달라서, 정확히 5등분한
+//    경계선이 캡션 글자를 위/아래로 자르거나 옆 칸 글자를 섞어 넣었다.
+// 알파 채널을 읽어서 실제 그림이 있는 세로 영역(밴드)을 열(column)별로 찾아
+// 그 경계로 자르고, 가로/세로를 같은 비율로만 축소해서 비율이 틀어지지 않게
+// 한다. 밴드를 정확히 5개(행 수) 찾지 못하면(시트 형식이 다르거나 감지 실패)
+// 기존 균등분할로 폴백해서 항상 동작은 보장한다.
+function sliceStickerSheet(img) {
+  const width = img.naturalWidth;
+  const height = img.naturalHeight;
+  const cols = 2;
+  const rows = 5;
+  const cellW = width / cols;
+  const cellH = height / rows;
+  const MAX_SIDE = 360;
+
+  const drawScaled = (sx, sy, sw, sh) => {
+    const scale = Math.min(1, MAX_SIDE / Math.max(sw, sh));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(sw * scale));
+    canvas.height = Math.max(1, Math.round(sh * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/png');
+  };
+
+  const fallback = () => {
+    const list = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        list.push(drawScaled(c * cellW, r * cellH, cellW, cellH));
+      }
+    }
+    return list;
+  };
+
+  try {
+    const full = document.createElement('canvas');
+    full.width = width;
+    full.height = height;
+    const fullCtx = full.getContext('2d');
+    fullCtx.drawImage(img, 0, 0);
+    const { data } = fullCtx.getImageData(0, 0, width, height);
+    const alphaAt = (x, y) => data[(y * width + x) * 4 + 3];
+
+    const columnBands = [];
+    for (let c = 0; c < cols; c++) {
+      const xStart = Math.round(c * cellW);
+      const xEnd = Math.round((c + 1) * cellW);
+      const rowHasContent = new Array(height).fill(false);
+      for (let y = 0; y < height; y++) {
+        let hits = 0;
+        for (let x = xStart; x < xEnd; x += 3) {
+          if (alphaAt(x, y) > 20 && ++hits > 3) break;
+        }
+        rowHasContent[y] = hits > 3;
+      }
+
+      const rawBands = [];
+      let start = -1;
+      for (let y = 0; y < height; y++) {
+        if (rowHasContent[y] && start === -1) start = y;
+        else if (!rowHasContent[y] && start !== -1) { rawBands.push([start, y]); start = -1; }
+      }
+      if (start !== -1) rawBands.push([start, height]);
+
+      // 노이즈(더듬이/장식 사이 좁은 틈 등)로 갈라진 작은 틈은 같은 칸으로 합친다.
+      const merged = [];
+      for (const band of rawBands) {
+        const prev = merged[merged.length - 1];
+        if (prev && band[0] - prev[1] < 10) prev[1] = band[1];
+        else merged.push([...band]);
+      }
+      columnBands.push(merged);
+    }
+
+    if (columnBands.some((bands) => bands.length !== rows)) {
+      return fallback();
+    }
+
+    const pad = 8;
+    const list = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const xStart = Math.round(c * cellW);
+        const xEnd = Math.round((c + 1) * cellW);
+        const [rawTop, rawBottom] = columnBands[c][r];
+        const top = Math.max(0, rawTop - pad);
+        const bottom = Math.min(height, rawBottom + pad);
+        list.push(drawScaled(xStart, top, xEnd - xStart, bottom - top));
+      }
+    }
+    return list;
+  } catch (e) {
+    return fallback();
+  }
+}
+
+// 키보드에 있는 기본(유니코드) 이모지를 1~3개만 단독으로 보낸 메시지는 말풍선
+// 없이 큰 글자로 보여주기 위한 판별 헬퍼. \p{Emoji_Component}는 숫자/#/* 같은
+// 일반 문자에도 걸리는 경우가 있어서 일부러 빼고, 실제 그림 이모지(Extended_
+// Pictographic)와 피부색 수정자/국기 조합/ZWJ/변형 선택자만 허용한다.
+const EMOJI_ONLY_RE = /^[\p{Extended_Pictographic}\p{Emoji_Modifier}\p{Regional_Indicator}‍️\s]+$/u;
+
+function getEmojiOnlyCount(content) {
+  if (!content || typeof content !== 'string') return null;
+  const trimmed = content.trim();
+  if (!trimmed || !EMOJI_ONLY_RE.test(trimmed)) return null;
+
+  // 화면에 실제로 보이는 이모지 개수를 세려면(스킨톤 수정자, 국기, ZWJ 합성
+  // 이모지 등이 여러 코드포인트로 이루어져 있어도 1개로 세야 함) grapheme
+  // 단위로 나누는 Intl.Segmenter를 쓰고, 지원 안 하는 환경에서는 코드포인트
+  // 배열 스프레드로 대체한다(정확도는 조금 떨어지지만 동작은 보장됨).
+  const graphemes = typeof Intl !== 'undefined' && Intl.Segmenter
+    ? [...new Intl.Segmenter('ko', { granularity: 'grapheme' }).segment(trimmed)].map((s) => s.segment)
+    : [...trimmed];
+  const count = graphemes.filter((g) => g.trim().length > 0).length;
+  return count >= 1 && count <= 3 ? count : null;
+}
+
+function emojiOnlySizeClass(count) {
+  if (count === 1) return 'text-6xl';
+  if (count === 2) return 'text-5xl';
+  return 'text-4xl';
+}
+
 export default function RoomPage() {
   const { id: roomId } = useParams();
   const router = useRouter();
@@ -77,6 +206,13 @@ export default function RoomPage() {
   // 문제가 있었다. 컨테이너의 scrollTop만 직접 옮기면 이 컨테이너 안에서만
   // 스크롤되고 페이지 자체는 절대 움직이지 않는다.
   const messagesContainerRef = useRef(null);
+  // 화면 전체를 뷰포트에 고정하는 바깥 래퍼(아래 JSX 참고)에 대한 ref.
+  // 키보드가 뜰 때 visualViewport 기준으로 높이/오프셋을 직접 보정하는 데 쓴다.
+  const viewportWrapRef = useRef(null);
+  // 이 방에서 "맨 아래로 스크롤"을 이미 한 번 했는지 여부. 방에 처음 들어와
+  // 메시지가 한꺼번에 채워질 때는 즉시 이동시키고, 이미 보고 있는 중에 새
+  // 메시지가 도착했을 때만 부드럽게 스크롤한다(아래 스크롤 useEffect 참고).
+  const hasScrolledOnceRef = useRef(false);
   const fileRef = useRef(null);
   // "보내기" 버튼을 탭하면 포커스가 버튼으로 넘어가면서 모바일 키보드가 바로
   // 닫혀버리는 문제가 있어서, 버튼이 포커스를 가져가지 못하게 막고(mouseDown에서
@@ -103,22 +239,7 @@ export default function RoomPage() {
     PACKS.forEach((pack) => {
       const img = new Image();
       img.onload = () => {
-        const cellW = img.naturalWidth / 2;
-        const cellH = img.naturalHeight / 5;
-        const list = [];
-        const canvas = document.createElement('canvas');
-        canvas.width = Math.min(cellW, 360);
-        canvas.height = Math.min(cellH, 360);
-        const ctx = canvas.getContext('2d');
-
-        for (let r = 0; r < 5; r++) {
-          for (let c = 0; c < 2; c++) {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ctx.drawImage(img, c * cellW, r * cellH, cellW, cellH, 0, 0, canvas.width, canvas.height);
-            list.push(canvas.toDataURL('image/png'));
-          }
-        }
-        setStickers((prev) => ({ ...prev, [pack.id]: list }));
+        setStickers((prev) => ({ ...prev, [pack.id]: sliceStickerSheet(img) }));
       };
       img.onerror = () => {};
       img.src = pack.src;
@@ -128,34 +249,62 @@ export default function RoomPage() {
   useEffect(() => {
     if (!roomId || !session) return;
     supabase.from('rooms').select('*').eq('id', roomId).single().then(({ data }) => {
-      if (data) {
-        setRoom(data);
-        // 링크로 바로 들어온 사람도 "내 대화방 목록"에 자동 등록되도록
-        // 계정(room_members) 기준으로 동기화한다 (기존 localStorage 동작을 대체).
-        // 실패해도 조용히 무시되던 것을 콘솔에 남겨서, 목록에 방이 안 뜰 때
-        // 원인(RLS, 네트워크 등)을 바로 알 수 있게 한다.
-        supabase
-          .from('room_members')
-          .upsert([{ room_id: data.id, user_id: session.user.id }], {
-            onConflict: 'room_id,user_id',
-            ignoreDuplicates: true,
-          })
-          .then(({ error }) => {
-            if (error) console.error('[room] room_members 동기화 실패:', error.message);
-          });
+      if (!data) { setLoading(false); return; }
+      setRoom(data);
+      // 링크로 바로 들어온 사람도 "내 대화방 목록"에 자동 등록되도록
+      // 계정(room_members) 기준으로 동기화한다 (기존 localStorage 동작을 대체).
+      // 실패해도 조용히 무시되던 것을 콘솔에 남겨서, 목록에 방이 안 뜰 때
+      // 원인(RLS, 네트워크 등)을 바로 알 수 있게 한다.
+      supabase
+        .from('room_members')
+        .upsert([{ room_id: data.id, user_id: session.user.id }], {
+          onConflict: 'room_id,user_id',
+          ignoreDuplicates: true,
+        })
+        .then(({ error }) => {
+          if (error) console.error('[room] room_members 동기화 실패:', error.message);
+        });
 
-        // localStorage 사용: sessionStorage는 브라우징 컨텍스트(탭)별로 분리되어
-        // 있어서, 알림을 눌러 열리는 새 창(sw.js의 clients.openWindow)은 매번
-        // 빈 세션으로 시작한다 — 비밀번호를 풀고 닉네임을 정해도 다음번에 알림을
-        // 눌러 들어오면 또 처음부터 물어보던 게 이 때문이었다. localStorage는
-        // 같은 기기·브라우저 안에서 탭/창에 상관없이 공유되므로 한 번만 하면 된다.
-        if (localStorage.getItem(`unlocked_${roomId}`) === 'true' || !data.password) {
-          setIsUnlocked(true);
-        }
-        const savedNick = localStorage.getItem(`nick_${roomId}`);
-        if (savedNick) { setNickname(savedNick); setIsJoined(true); }
+      // localStorage 사용: sessionStorage는 브라우징 컨텍스트(탭)별로 분리되어
+      // 있어서, 알림을 눌러 열리는 새 창(sw.js의 clients.openWindow)은 매번
+      // 빈 세션으로 시작한다 — 비밀번호를 풀고 닉네임을 정해도 다음번에 알림을
+      // 눌러 들어오면 또 처음부터 물어보던 게 이 때문이었다. localStorage는
+      // 같은 기기·브라우저 안에서 탭/창에 상관없이 공유되므로 한 번만 하면 된다.
+      if (localStorage.getItem(`unlocked_${roomId}`) === 'true' || !data.password) {
+        setIsUnlocked(true);
       }
-      setLoading(false);
+      const savedNick = localStorage.getItem(`nick_${roomId}`);
+      if (savedNick) {
+        setNickname(savedNick);
+        setIsJoined(true);
+        // 이 기기엔 이미 닉네임이 저장돼 있으니 서버 확인 없이 바로 보여준다.
+        setLoading(false);
+        return;
+      }
+
+      // 이 기기에는 저장된 닉네임이 없는(=새 기기/새 브라우저) 경우, 같은 계정으로
+      // 다른 기기에서 이미 이 방에 입장한 적이 있는지 서버(room_members.nickname)로
+      // 확인한다. nickname 컬럼은 join() 함수(아래)에서 비밀번호를 통과하고 닉네임을
+      // 정한 뒤에만 채워지므로, 값이 있다는 사실 자체가 "과거 이 계정으로 비밀번호를
+      // 통과했다"는 증거가 된다 — 그래서 이 값이 있으면 비밀번호/닉네임 입력 화면을
+      // 건너뛰고 바로 대화창으로 들어가게 해서, 어느 기기로 로그인하든 같은 이메일
+      // 계정이면 닉네임도 같고 비밀번호도 다시 묻지 않게 한다.
+      supabase
+        .from('room_members')
+        .select('nickname')
+        .eq('room_id', roomId)
+        .eq('user_id', session.user.id)
+        .maybeSingle()
+        .then(({ data: memberRow }) => {
+          if (memberRow?.nickname) {
+            localStorage.setItem(`unlocked_${roomId}`, 'true');
+            localStorage.setItem(`nick_${roomId}`, memberRow.nickname);
+            setIsUnlocked(true);
+            setNickname(memberRow.nickname);
+            setIsJoined(true);
+          }
+          setLoading(false);
+        });
     });
   }, [roomId, session]);
 
@@ -258,12 +407,61 @@ export default function RoomPage() {
     };
   }, [isJoined, isUnlocked, roomId]);
 
+  // 방을 나갔다가(뒤로가기) 다시 들어올 때 hasScrolledOnceRef도 새로 시작하도록.
+  // 대부분은 페이지 이동으로 컴포넌트 자체가 다시 마운트되어 자연히 초기화되지만,
+  // 혹시 같은 컴포넌트가 재사용되는 경우까지 대비한 방어 코드.
   useEffect(() => {
-    if (!isSelectMode && !editingId && !pendingImages) {
-      const el = messagesContainerRef.current;
-      if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    hasScrolledOnceRef.current = false;
+  }, [roomId]);
+
+  useEffect(() => {
+    if (isSelectMode || editingId || pendingImages || messages.length === 0) return;
+    const el = messagesContainerRef.current;
+    if (!el) return;
+
+    // 방에 처음 들어와 서버에서 메시지가 한꺼번에 로드될 때 매번 맨 위부터
+    // 맨 아래까지 smooth 스크롤이 재생되면, 대화가 길수록 시간이 오래 걸리고
+    // 불필요하게 화면이 쭉 흘러내려가는 것처럼 보였다. 이 방에서 처음 스크롤할
+    // 때만 즉시(auto) 이동시키고, 이미 최신 메시지를 보고 있는 상태에서 새
+    // 메시지가 도착했을 때만 부드럽게(smooth) 스크롤한다.
+    if (!hasScrolledOnceRef.current) {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'auto' });
+      hasScrolledOnceRef.current = true;
+    } else {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
     }
   }, [messages, isSelectMode, editingId, pendingImages]);
+
+  // 키보드가 뜰 때 헤더가 화면 밖으로 밀리는 문제의 잔여 케이스 보정.
+  // body/래퍼를 position:fixed + h-[100dvh]로 고정해도(globals.css, 아래 JSX 참고),
+  // iOS Safari나 일부 인앱 브라우저는 레이아웃 뷰포트는 그대로 둔 채 "포커스된
+  // 입력창이 보이도록" 문서 자체를 스크롤시켜 버려서, fixed로 고정해둔 헤더까지
+  // 화면 밖으로 밀려 보이지 않는 경우가 남아있다. window.visualViewport는 이런
+  // 스크롤/축소와 무관하게 "지금 실제로 보이는 영역"의 크기(height)와 문서 기준
+  // 오프셋(offsetTop)을 알려주므로, 이를 그대로 래퍼에 반영하면 브라우저가 문서를
+  // 어떻게 스크롤시키든 항상 화면에 보이는 영역에 붙어있게 만들 수 있다.
+  useEffect(() => {
+    if (!isJoined || !isUnlocked) return;
+    const vv = window.visualViewport;
+    const el = viewportWrapRef.current;
+    if (!vv || !el) return;
+
+    const sync = () => {
+      el.style.height = `${vv.height}px`;
+      el.style.transform = vv.offsetTop ? `translateY(${vv.offsetTop}px)` : '';
+    };
+
+    sync();
+    vv.addEventListener('resize', sync);
+    vv.addEventListener('scroll', sync);
+
+    return () => {
+      vv.removeEventListener('resize', sync);
+      vv.removeEventListener('scroll', sync);
+      el.style.height = '';
+      el.style.transform = '';
+    };
+  }, [isJoined, isUnlocked]);
 
   // 아바타 변경 모달에 보여줄 내 프로필 사진도 미리 캐시에 채워둔다.
   useEffect(() => {
@@ -553,7 +751,10 @@ export default function RoomPage() {
     // containing block 크기로 굳어질 수 있어 키보드가 열려도 안 줄어들 수 있다.
     // PC에서 쓰던 가운데 정렬(max-w-2xl mx-auto)은 fixed로 빠지면서 사라지므로,
     // 바깥에 flex justify-center를 둔 래퍼를 하나 더 씌워 대신한다.
-    <div className="fixed top-0 left-0 w-full h-[100dvh] flex justify-center bg-neutral-300 overflow-hidden">
+    // 그래도 iOS Safari 등 일부 브라우저는 위 CSS만으로 못 잡는 잔여 케이스가
+    // 있어서(레이아웃 뷰포트는 안 줄이고 문서 자체를 스크롤시켜 버림),
+    // viewportWrapRef를 통해 visualViewport 기반 보정을 추가로 건다(위 useEffect 참고).
+    <div ref={viewportWrapRef} className="fixed top-0 left-0 w-full h-[100dvh] flex justify-center bg-neutral-300 overflow-hidden">
     <div className="flex flex-col w-full h-full max-w-2xl bg-[#EBF2F7] border-x border-neutral-300 shadow-2xl relative">
       {/* 상단 헤더 */}
       <header className="flex items-center justify-between px-3 py-2.5 bg-white/95 backdrop-blur border-b border-neutral-200 sticky top-0 z-20 shadow-xs">
@@ -722,6 +923,9 @@ export default function RoomPage() {
             const isMe = msg.user_id ? msg.user_id === session.user.id : msg.sender === nickname;
             const isImg = msg.content?.startsWith('data:image/jpeg');
             const isSticker = msg.content?.startsWith('data:image/png');
+            // 키보드 기본 이모지를 1~3개만 단독으로 보낸 경우 말풍선 없이 크게
+            // 보여주기 위한 개수(1~3) 판별. 사진/스티커는 대상이 아니다.
+            const emojiOnlyCount = !isImg && !isSticker ? getEmojiOnlyCount(msg.content) : null;
             const isEditing = editingId === msg.id;
 
             return (
@@ -825,6 +1029,13 @@ export default function RoomPage() {
                         className="rounded-xl max-h-64 max-w-[280px] object-cover cursor-pointer hover:opacity-95"
                         onClick={() => setLightboxMsg(msg)}
                       />
+                    </div>
+                  ) : emojiOnlyCount ? (
+                    // 기본 이모지 1~3개만 보낸 메시지는 스티커처럼 말풍선 없이
+                    // 큰 글자로만 보여주고, 등장할 때 살짝 튀어오르는 pop-in
+                    // 애니메이션을 줘서 밋밋하지 않게 한다(globals.css 참고).
+                    <div className={`emoji-pop leading-none ${emojiOnlySizeClass(emojiOnlyCount)}`}>
+                      {msg.content}
                     </div>
                   ) : (
                     <div
@@ -1031,9 +1242,9 @@ export default function RoomPage() {
               </button>
             </div>
 
-            <div className="p-3 grid grid-cols-5 gap-2 max-h-52 overflow-y-auto">
+            <div className="p-3 grid grid-cols-4 gap-2.5 max-h-72 overflow-y-auto">
               {(stickers[activePack] || []).length === 0 ? (
-                <div className="col-span-5 text-center py-6 text-xs text-neutral-400">
+                <div className="col-span-4 text-center py-6 text-xs text-neutral-400">
                   이모티콘 파일을 불러오는 중입니다...
                 </div>
               ) : (
@@ -1042,9 +1253,9 @@ export default function RoomPage() {
                     key={idx}
                     type="button"
                     onClick={() => { send(stickerUrl); setShowEmojiPicker(false); }}
-                    className="p-1 hover:bg-neutral-100 active:scale-90 rounded-2xl transition flex items-center justify-center cursor-pointer"
+                    className="p-1.5 hover:bg-neutral-100 active:scale-90 rounded-2xl transition flex items-center justify-center cursor-pointer"
                   >
-                    <img src={stickerUrl} alt="스티커" className="w-14 h-14 object-contain" />
+                    <img src={stickerUrl} alt="스티커" className="w-20 h-20 object-contain" />
                   </button>
                 ))
               )}

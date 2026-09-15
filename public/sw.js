@@ -17,18 +17,40 @@ self.addEventListener('push', (event) => {
     icon: '/favicon.ico',
   };
 
-  event.waitUntil(self.registration.showNotification(title, options));
+  // tag가 같으면(같은 대화방) showNotification이 알아서 이전 알림을 대체해주는 게
+  // 표준 동작이지만, 브라우저/OS 조합에 따라 이 대체가 제대로 안 먹혀서 같은
+  // 방 알림이 여러 개 계속 쌓이는 경우가 있다. 새로 띄우기 전에 같은 tag를 가진
+  // 기존 알림을 직접 찾아 닫아서, 항상 방 하나당 알림 하나만 남도록 강제한다.
+  event.waitUntil(
+    (async () => {
+      if (options.tag) {
+        const existing = await self.registration.getNotifications({ tag: options.tag });
+        existing.forEach((n) => n.close());
+      }
+      await self.registration.showNotification(title, options);
+    })()
+  );
 });
 
 self.addEventListener('notificationclick', (event) => {
+  const tag = event.notification.tag;
   event.notification.close();
   const url = (event.notification.data && event.notification.data.url) || '/';
 
   event.waitUntil(
-    clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+    (async () => {
+      // 알림을 눌러 들어가면 그 대화방을 확인한 것이므로, 폰 알림 목록에 남아있는
+      // 같은 대화방(tag가 같은) 알림도 함께 지워서 "확인 안 한 메시지"처럼 계속
+      // 남아있지 않게 한다. 다른 대화방 알림은 그대로 둔다.
+      if (tag) {
+        const sameRoom = await self.registration.getNotifications({ tag });
+        sameRoom.forEach((n) => n.close());
+      }
+
+      const list = await clients.matchAll({ type: 'window', includeUncontrolled: true });
       const existing = list.find((c) => c.url.includes(url));
       if (existing) return existing.focus();
       return clients.openWindow(url);
-    })
+    })()
   );
 });

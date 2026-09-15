@@ -44,3 +44,17 @@ body {
   /* 더블탭 확대 등 불필요한 제스처 확대를 막아서 화면이 흔들리지 않게 한다 */
   touch-action: manipulation;
 }
+
+/* 기본 이모지 1~3개만 단독으로 보낸 메시지가 등장할 때 살짝 튀어오르는 느낌을
+   주는 애니메이션. 이 프로젝트에는 tailwindcss-animate 같은 플러그인이 설치돼
+   있지 않아(기존 코드의 animate-in/fade-in류 클래스는 사실 동작하지 않는
+   무효 클래스임) 순수 CSS keyframes로 직접 구현한다. */
+@keyframes emoji-pop {
+  0% { transform: scale(0.4); opacity: 0; }
+  60% { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+.emoji-pop {
+  animation: emoji-pop 260ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
