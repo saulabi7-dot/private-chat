@@ -541,7 +541,20 @@ export default function RoomPage() {
   }
 
   return (
-    <div className="flex flex-col w-full h-[100dvh] max-w-2xl mx-auto bg-[#EBF2F7] border-x border-neutral-300 shadow-2xl relative">
+    // 바깥 래퍼를 position:fixed로 실제 뷰포트(top:0/left:0 + 명시적 100dvh)에
+    // 고정한다. 예전엔 이 래퍼가 position:relative(문서 흐름 안)였는데, 모바일에서
+    // 입력창에 포커스가 가면 iOS/Android가 "포커스된 요소를 보이게" 문서(body)를
+    // 자체적으로 스크롤시키는 경우가 있어서, 그 스크롤을 따라 sticky 헤더가 함께
+    // 위로 밀려 화면 밖으로 사라져 버렸다(레이아웃 자체의 top:0에는 붙어있지만,
+    // 스크롤된 문서 좌표계 안에서 밀려난 것). fixed는 문서 스크롤과 완전히
+    // 무관하게 실제 화면 좌표에 고정되므로 이 현상 자체가 원천적으로 발생하지
+    // 않는다. inset-0 대신 h-[100dvh]를 명시하는 이유는, 키보드가 열렸을 때
+    // 브라우저가 줄여주는 값이 동적 뷰포트 단위(dvh)이기 때문 — inset-0은 초기
+    // containing block 크기로 굳어질 수 있어 키보드가 열려도 안 줄어들 수 있다.
+    // PC에서 쓰던 가운데 정렬(max-w-2xl mx-auto)은 fixed로 빠지면서 사라지므로,
+    // 바깥에 flex justify-center를 둔 래퍼를 하나 더 씌워 대신한다.
+    <div className="fixed top-0 left-0 w-full h-[100dvh] flex justify-center bg-neutral-300 overflow-hidden">
+    <div className="flex flex-col w-full h-full max-w-2xl bg-[#EBF2F7] border-x border-neutral-300 shadow-2xl relative">
       {/* 상단 헤더 */}
       <header className="flex items-center justify-between px-3 py-2.5 bg-white/95 backdrop-blur border-b border-neutral-200 sticky top-0 z-20 shadow-xs">
         <button
@@ -1078,6 +1091,7 @@ export default function RoomPage() {
           </button>
         </form>
       </footer>
+    </div>
     </div>
   );
 }
