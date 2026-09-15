@@ -78,6 +78,10 @@ export default function RoomPage() {
   // 스크롤되고 페이지 자체는 절대 움직이지 않는다.
   const messagesContainerRef = useRef(null);
   const fileRef = useRef(null);
+  // "보내기" 버튼을 탭하면 포커스가 버튼으로 넘어가면서 모바일 키보드가 바로
+  // 닫혀버리는 문제가 있어서, 버튼이 포커스를 가져가지 못하게 막고(mouseDown에서
+  // preventDefault) 전송 후에도 입력창에 포커스를 유지시키는 데 쓴다.
+  const textInputRef = useRef(null);
 
   const formatTime = (iso) => {
     if (!iso) return '';
@@ -387,6 +391,9 @@ export default function RoomPage() {
     send(text.trim());
     setText('');
     setShowEmojiPicker(false);
+    // 모바일에서 "보내기" 버튼 탭으로 포커스가 잠깐 빠져나가 키보드가 내려가는
+    // 경우를 대비해, 전송 후 입력창에 포커스를 다시 준다.
+    textInputRef.current?.focus();
   };
 
   const handleKeyDown = (e) => {
@@ -1052,6 +1059,7 @@ export default function RoomPage() {
           </button>
 
           <input
+            ref={textInputRef}
             placeholder="메시지를 입력하세요..."
             value={text}
             onChange={(e) => setText(e.target.value)}
@@ -1062,6 +1070,7 @@ export default function RoomPage() {
           <button
             type="submit"
             disabled={!text.trim()}
+            onMouseDown={(e) => e.preventDefault()}
             className="p-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-full shadow-xs transition disabled:opacity-40"
             title="보내기"
           >
