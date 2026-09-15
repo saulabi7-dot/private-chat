@@ -2,10 +2,27 @@ import webpush from 'web-push';
 import { supabase } from '@/lib/supabase';
 import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 
-// POST { roomId, title, body }
+type PushError = Error & {
+  statusCode?: number;
+  body?: string;
+};
+
+type RoomMember = {
+  user_id: string;
+};
+
+type StoredSubscription = {
+  id: string;
+  endpoint: string;
+  subscription: webpush.PushSubscription;
+};
+
+// POST { roomId, title, body, senderEndpoint? }
 // Header: Authorization: Bearer <session.access_token>
 //
-// 같은 방(room_members)의 "다른" 멤버들에게 웹 푸시 알림을 발송한다.
+// 같은 방(room_members)의 모든 계정이 등록한 기기에 웹 푸시 알림을 발송하되,
+// 실제 메시지를 보낸 브라우저 endpoint만 제외한다. 같은 계정으로 로그인한 PC와
+// iPhone을 함께 쓰는 경우에도 다른 기기에서는 알림을 받을 수 있어야 하기 때문이다.
 // 채팅 자체와는 별개의 best-effort 기능이라 실패해도 항상 200을 반환한다.
 export async function POST(request: Request) {
   try {
@@ -21,45 +38,70 @@ export async function POST(request: Request) {
     }
     const senderId = userData.user.id;
 
-    const { roomId, title, body } = await request.json();
+    const { roomId, title, body, senderEndpoint } = await request.json();
     if (!roomId) {
       return Response.json({ error: 'roomId가 필요합니다.' }, { status: 400 });
+    }
+    if (senderEndpoint !== undefined && typeof senderEndpoint !== 'string') {
+      return Response.json({ error: 'senderEndpoint 형식이 올바르지 않습니다.' }, { status: 400 });
     }
 
     const admin = getSupabaseAdmin();
 
     // 발신자가 실제로 이 방의 멤버인지 확인 (아니면 다른 방에 알림을 흘려보낼 수 있음)
-    const { data: senderMembership } = await admin
+    const { data: senderMembership, error: membershipError } = await admin
       .from('room_members')
       .select('user_id')
       .eq('room_id', roomId)
       .eq('user_id', senderId)
       .maybeSingle();
 
+    if (membershipError) {
+      console.error('[notify] 발신자 멤버십 조회 실패:', membershipError.message);
+      return Response.json({ ok: false, error: '멤버십 조회 실패' }, { status: 200 });
+    }
     if (!senderMembership) {
       return Response.json({ error: '이 방의 멤버가 아닙니다.' }, { status: 403 });
     }
 
-    // 같은 방의 "다른" 멤버들
-    const { data: members } = await admin
+    // 같은 방의 모든 멤버를 조회한다. 발신 계정 자체를 빼면 같은 계정으로 로그인한
+    // 다른 PC/폰까지 함께 제외되므로, 구독 조회 단계에서 발신 endpoint만 제외한다.
+    const { data: members, error: membersError } = await admin
       .from('room_members')
       .select('user_id')
-      .eq('room_id', roomId)
-      .neq('user_id', senderId);
+      .eq('room_id', roomId);
 
-    const recipientIds = (members || []).map((m) => m.user_id);
+    if (membersError) {
+      console.error('[notify] 수신자 조회 실패:', membersError.message);
+      return Response.json({ ok: false, error: '수신자 조회 실패' }, { status: 200 });
+    }
+
+    const recipientIds = [
+      ...new Set(((members || []) as RoomMember[]).map((member) => member.user_id)),
+    ];
     if (recipientIds.length === 0) {
       return Response.json({ ok: true, sent: 0 });
     }
 
-    const { data: subscriptions } = await admin
+    let subscriptionsQuery = admin
       .from('push_subscriptions')
       .select('id, endpoint, subscription')
       .in('user_id', recipientIds);
 
+    if (senderEndpoint) {
+      subscriptionsQuery = subscriptionsQuery.neq('endpoint', senderEndpoint);
+    }
+
+    const { data: subscriptions, error: subscriptionsError } = await subscriptionsQuery;
+
+    if (subscriptionsError) {
+      console.error('[notify] 구독 조회 실패:', subscriptionsError.message);
+      return Response.json({ ok: false, error: '구독 조회 실패' }, { status: 200 });
+    }
     if (!subscriptions || subscriptions.length === 0) {
       return Response.json({ ok: true, sent: 0 });
     }
+    const storedSubscriptions = subscriptions as StoredSubscription[];
 
     const publicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
     const privateKey = process.env.VAPID_PRIVATE_KEY;
@@ -78,14 +120,15 @@ export async function POST(request: Request) {
 
     const staleIds: string[] = [];
     await Promise.all(
-      subscriptions.map(async (row) => {
+      storedSubscriptions.map(async (row) => {
         try {
           await webpush.sendNotification(row.subscription, payload);
-        } catch (err: any) {
-          if (err?.statusCode === 404 || err?.statusCode === 410) {
+        } catch (error: unknown) {
+          const err = error as PushError;
+          if (err.statusCode === 404 || err.statusCode === 410) {
             staleIds.push(row.id);
           } else {
-            console.error('[notify] 발송 실패:', err?.statusCode, err?.body);
+            console.error('[notify] 발송 실패:', err.statusCode, err.body);
           }
         }
       })
@@ -95,10 +138,11 @@ export async function POST(request: Request) {
       await admin.from('push_subscriptions').delete().in('id', staleIds);
     }
 
-    return Response.json({ ok: true, sent: subscriptions.length - staleIds.length });
-  } catch (err: any) {
+    return Response.json({ ok: true, sent: storedSubscriptions.length - staleIds.length });
+  } catch (error: unknown) {
+    const err = error as Error;
     console.error('[notify] 처리 중 오류:', err);
     // 알림은 best-effort이므로 실패해도 채팅 자체에 영향이 없도록 200으로 응답
-    return Response.json({ ok: false, error: err?.message || 'unknown error' }, { status: 200 });
+    return Response.json({ ok: false, error: err.message || 'unknown error' }, { status: 200 });
   }
 }

@@ -5,7 +5,7 @@ self.addEventListener('push', (event) => {
   let data = {};
   try {
     data = event.data ? event.data.json() : {};
-  } catch (e) {
+  } catch {
     data = {};
   }
 
@@ -14,8 +14,10 @@ self.addEventListener('push', (event) => {
     body: data.body || '',
     data: { url: data.url || '/' },
     tag: data.tag,
+    requireInteraction: false,
     icon: '/favicon.ico',
   };
+  if (data.tag) options.renotify = true;
 
   // tag가 같으면(같은 대화방) showNotification이 알아서 이전 알림을 대체해주는 게
   // 표준 동작이지만, 브라우저/OS 조합에 따라 이 대체가 제대로 안 먹혀서 같은
