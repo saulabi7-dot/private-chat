@@ -6,6 +6,7 @@ import {
   Download, FolderDown,
 } from 'lucide-react';
 import { downloadDataUrl, downloadMany, isDirectoryPickerSupported, filenameFor } from '@/lib/download';
+import ZoomableImage from '@/components/ZoomableImage';
 
 function formatDate(iso) {
   if (!iso) return '';
@@ -24,8 +25,8 @@ function formatTime(iso) {
 }
 
 // "..." 메뉴 → "사진첩"에서 여는 모달. 이미 방 페이지가 들고 있는 messages를
-// 그대로 받아서(별도 쿼리 없이) 사진 메시지(content가 data:image/jpeg로
-// 시작)만 추려 날짜별로 묶어 썸네일 그리드로 보여준다. 카카오톡/텔레그램의
+// 그대로 받아서(별도 쿼리 없이) 이미지 data URL 중 스티커 PNG를 제외한 사진
+// 메시지만 추려 날짜별로 묶어 썸네일 그리드로 보여준다. 카카오톡/텔레그램의
 // 사진첩과 동일한 동작: 썸네일 탭 → 확대 보기, "선택" → 다중 선택 후 일괄
 // 다운로드(기본 폴더 또는, 지원 브라우저에서는 다른 폴더 선택).
 export default function PhotoGalleryModal({ messages, onClose }) {
@@ -36,7 +37,7 @@ export default function PhotoGalleryModal({ messages, onClose }) {
 
   const photos = useMemo(() => {
     return messages
-      .filter((m) => typeof m.content === 'string' && m.content.startsWith('data:image/jpeg'))
+      .filter((m) => typeof m.content === 'string' && m.content.startsWith('data:image/') && (!m.content.startsWith('data:image/png') || m.content.length >= 900_000))
       .slice()
       .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
   }, [messages]);
@@ -229,10 +230,11 @@ export default function PhotoGalleryModal({ messages, onClose }) {
                 <ChevronLeft size={26} />
               </button>
             )}
-            <img
+            <ZoomableImage
               src={photos[lightboxIdx].content}
               alt="사진"
               className="max-h-full max-w-full object-contain"
+              containerClassName="w-full h-full flex items-center justify-center"
             />
             {lightboxIdx < photos.length - 1 && (
               <button

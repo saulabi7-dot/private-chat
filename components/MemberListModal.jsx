@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '@/lib/supabase';
 import { UserCircle2, X } from 'lucide-react';
+import ZoomableImage from '@/components/ZoomableImage';
 
 function formatDate(iso) {
   if (!iso) return '';
@@ -17,6 +18,7 @@ function formatDate(iso) {
 // 클라이언트에서 합친다.
 export default function MemberListModal({ roomId, myUserId, onClose }) {
   const [members, setMembers] = useState(null); // null = 불러오는 중
+  const [avatarViewerUrl, setAvatarViewerUrl] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -73,7 +75,10 @@ export default function MemberListModal({ roomId, myUserId, onClose }) {
           ) : (
             members.map((m) => (
               <div key={m.user_id} className="flex items-center space-x-3 px-2 py-2 rounded-xl hover:bg-neutral-50">
-                <div className="w-9 h-9 rounded-full bg-blue-50 text-blue-600 flex items-center justify-center overflow-hidden border border-blue-100 shrink-0">
+                <div
+                  onClick={() => m.avatar_url && setAvatarViewerUrl(m.avatar_url)}
+                  className={`w-9 h-9 rounded-full bg-blue-50 text-blue-600 flex items-center justify-center overflow-hidden border border-blue-100 shrink-0 ${m.avatar_url ? 'cursor-pointer' : ''}`}
+                >
                   {m.avatar_url ? (
                     <img src={m.avatar_url} alt={m.nickname || '참여자'} className="w-full h-full object-cover" />
                   ) : (
@@ -94,6 +99,24 @@ export default function MemberListModal({ roomId, myUserId, onClose }) {
           )}
         </div>
       </div>
+
+      {/* 참여자 프로필 사진 확대보기 라이트박스 (핀치줌/더블탭 확대 가능) */}
+      {avatarViewerUrl && (
+        <div className="fixed inset-0 bg-black/90 flex flex-col z-[60] animate-in fade-in duration-100">
+          <div className="flex items-center justify-end px-4 py-3 shrink-0">
+            <button onClick={() => setAvatarViewerUrl(null)} className="p-2 text-white/90 hover:bg-white/10 rounded-full transition">
+              <X size={20} />
+            </button>
+          </div>
+          <ZoomableImage
+            src={avatarViewerUrl}
+            alt="프로필 사진"
+            className="max-h-full max-w-full object-contain rounded-2xl"
+            containerClassName="flex-1 flex items-center justify-center px-4 pb-4 w-full h-full"
+            onTap={() => setAvatarViewerUrl(null)}
+          />
+        </div>
+      )}
     </div>
   );
 }
