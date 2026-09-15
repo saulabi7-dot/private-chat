@@ -713,7 +713,13 @@ export default function RoomPage() {
           </div>
         ) : (
           messages.map((msg) => {
-            const isMe = msg.sender === nickname;
+            // 같은 계정이라도 기기마다(폰/PC) 닉네임을 다르게 설정해 놓으면, 예전엔
+            // "내가 보낸 메시지"를 msg.sender(닉네임 문자열)로만 판정해서 다른
+            // 기기에서 보낸 내 과거 메시지가 "상대방 메시지"처럼 왼쪽에 표시되는
+            // 문제가 있었다. user_id(계정, 기기가 바뀌어도 로그인 계정이면 항상
+            // 동일)로 판정하도록 고쳐서 닉네임이 달라도 항상 내 메시지로 인식되게
+            // 한다. user_id가 없는(컬럼 추가 이전) 옛 메시지만 닉네임 비교로 대체.
+            const isMe = msg.user_id ? msg.user_id === session.user.id : msg.sender === nickname;
             const isImg = msg.content?.startsWith('data:image/jpeg');
             const isSticker = msg.content?.startsWith('data:image/png');
             const isEditing = editingId === msg.id;
