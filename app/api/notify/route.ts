@@ -17,13 +17,13 @@ type StoredSubscription = {
   subscription: webpush.PushSubscription;
 };
 
-// POST { roomId, title, body, senderEndpoint? }
+// POST { roomId, title, body }
 // Header: Authorization: Bearer <session.access_token>
 //
-// 같은 방(room_members)의 모든 계정이 등록한 기기에 웹 푸시 알림을 발송하되,
-// 실제 메시지를 보낸 브라우저 endpoint만 제외한다. 같은 계정으로 로그인한 PC와
-// iPhone을 함께 쓰는 경우에도 다른 기기에서는 알림을 받을 수 있어야 하기 때문이다.
-// 채팅 자체와는 별개의 best-effort 기능이라 실패해도 항상 200을 반환한다.
+// 같은 방(room_members)의 멤버가 등록한 기기에 웹 푸시 알림을 발송하되, 발신
+// "계정" 자신의 기기는 전부 제외한다(같은 계정으로 로그인한 PC/폰이 여러 대여도
+// 내가 보낸 메시지 알림이 내 다른 기기로는 가지 않아야 하기 때문). 채팅 자체와는
+// 별개의 best-effort 기능이라 실패해도 항상 200을 반환한다.
 export async function POST(request: Request) {
   try {
     const authHeader = request.headers.get('authorization') || '';
@@ -38,12 +38,9 @@ export async function POST(request: Request) {
     }
     const senderId = userData.user.id;
 
-    const { roomId, title, body, senderEndpoint } = await request.json();
+    const { roomId, title, body } = await request.json();
     if (!roomId) {
       return Response.json({ error: 'roomId가 필요합니다.' }, { status: 400 });
-    }
-    if (senderEndpoint !== undefined && typeof senderEndpoint !== 'string') {
-      return Response.json({ error: 'senderEndpoint 형식이 올바르지 않습니다.' }, { status: 400 });
     }
 
     const admin = getSupabaseAdmin();
@@ -64,8 +61,9 @@ export async function POST(request: Request) {
       return Response.json({ error: '이 방의 멤버가 아닙니다.' }, { status: 403 });
     }
 
-    // 같은 방의 모든 멤버를 조회한다. 발신 계정 자체를 빼면 같은 계정으로 로그인한
-    // 다른 PC/폰까지 함께 제외되므로, 구독 조회 단계에서 발신 endpoint만 제외한다.
+    // 같은 방의 멤버를 조회하고, 발신 계정(senderId) 자신은 수신자에서 제외한다 —
+    // 이러면 발신 계정의 기기(구독)가 애초에 조회 대상에서 빠지므로, 어떤 기기로
+    // 보냈든 같은 계정의 다른 기기 전부에 알림이 가지 않는다.
     const { data: members, error: membersError } = await admin
       .from('room_members')
       .select('user_id')
@@ -78,21 +76,15 @@ export async function POST(request: Request) {
 
     const recipientIds = [
       ...new Set(((members || []) as RoomMember[]).map((member) => member.user_id)),
-    ];
+    ].filter((id) => id !== senderId);
     if (recipientIds.length === 0) {
       return Response.json({ ok: true, sent: 0 });
     }
 
-    let subscriptionsQuery = admin
+    const { data: subscriptions, error: subscriptionsError } = await admin
       .from('push_subscriptions')
       .select('id, endpoint, subscription')
       .in('user_id', recipientIds);
-
-    if (senderEndpoint) {
-      subscriptionsQuery = subscriptionsQuery.neq('endpoint', senderEndpoint);
-    }
-
-    const { data: subscriptions, error: subscriptionsError } = await subscriptionsQuery;
 
     if (subscriptionsError) {
       console.error('[notify] 구독 조회 실패:', subscriptionsError.message);

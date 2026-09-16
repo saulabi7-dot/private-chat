@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   X, ChevronLeft, ChevronRight, CheckSquare, Square,
   Download, FolderDown,
@@ -29,10 +29,11 @@ function formatTime(iso) {
 // 메시지만 추려 날짜별로 묶어 썸네일 그리드로 보여준다. 카카오톡/텔레그램의
 // 사진첩과 동일한 동작: 썸네일 탭 → 확대 보기, "선택" → 다중 선택 후 일괄
 // 다운로드(기본 폴더 또는, 지원 브라우저에서는 다른 폴더 선택).
-export default function PhotoGalleryModal({ messages, onClose }) {
+export default function PhotoGalleryModal({ messages, onClose, getFullImage, getFullImages }) {
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState([]);
   const [lightboxIdx, setLightboxIdx] = useState(null); // photos 배열 기준 인덱스
+  const [lightboxFullSrc, setLightboxFullSrc] = useState(null);
   const [downloading, setDownloading] = useState(false);
 
   const photos = useMemo(() => {
@@ -54,6 +55,19 @@ export default function PhotoGalleryModal({ messages, onClose }) {
 
   const dirSupported = isDirectoryPickerSupported();
 
+  // 라이트박스가 열리거나 사진이 바뀔 때 원본 이미지를 비동기로 가져온다.
+  // 썸네일이 먼저 보이고, 원본이 도착하면 선명해지는 방식.
+  useEffect(() => {
+    if (lightboxIdx === null || !photos[lightboxIdx]) return;
+    let cancelled = false;
+    if (getFullImage) {
+      getFullImage(photos[lightboxIdx]).then((full) => {
+        if (!cancelled) setLightboxFullSrc(full);
+      });
+    }
+    return () => { cancelled = true; };
+  }, [lightboxIdx, photos, getFullImage]);
+
   const toggleSelect = (id) => {
     setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   };
@@ -62,8 +76,13 @@ export default function PhotoGalleryModal({ messages, onClose }) {
     setSelectedIds(selectedIds.length === photos.length ? [] : photos.map((p) => p.id));
   };
 
-  const buildItems = (ids) => {
+  const buildItems = async (ids) => {
     const chosen = photos.filter((p) => ids.includes(p.id));
+    // getFullImages가 있으면 원본으로 다운로드, 없으면 content(폴백)
+    if (getFullImages) {
+      const fulls = await getFullImages(chosen);
+      return chosen.map((p, i) => ({ dataUrl: fulls[i], filename: filenameFor(p.created_at, p.idx + 1) }));
+    }
     return chosen.map((p) => ({ dataUrl: p.content, filename: filenameFor(p.created_at, p.idx + 1) }));
   };
 
@@ -71,7 +90,8 @@ export default function PhotoGalleryModal({ messages, onClose }) {
     if (selectedIds.length === 0 || downloading) return;
     setDownloading(true);
     try {
-      const result = await downloadMany(buildItems(selectedIds), { toDirectory });
+      const items = await buildItems(selectedIds);
+      const result = await downloadMany(items, { toDirectory });
       if (!result.cancelled) {
         setSelectMode(false);
         setSelectedIds([]);
@@ -87,11 +107,13 @@ export default function PhotoGalleryModal({ messages, onClose }) {
     if (selectMode) {
       toggleSelect(photo.id);
     } else {
+      setLightboxFullSrc(null);
       setLightboxIdx(photo.idx);
     }
   };
 
   const gotoLightbox = (delta) => {
+    setLightboxFullSrc(null);
     setLightboxIdx((cur) => {
       if (cur === null) return cur;
       const next = cur + delta;
@@ -209,13 +231,16 @@ export default function PhotoGalleryModal({ messages, onClose }) {
             </div>
             <div className="flex items-center space-x-1">
               <button
-                onClick={() => downloadDataUrl(photos[lightboxIdx].content, filenameFor(photos[lightboxIdx].created_at, photos[lightboxIdx].idx + 1))}
+                onClick={async () => {
+                  const full = lightboxFullSrc || (getFullImage ? await getFullImage(photos[lightboxIdx]) : photos[lightboxIdx].content);
+                  downloadDataUrl(full, filenameFor(photos[lightboxIdx].created_at, photos[lightboxIdx].idx + 1));
+                }}
                 className="p-2 hover:bg-white/10 rounded-full transition"
                 title="이 사진 다운로드"
               >
                 <Download size={19} />
               </button>
-              <button onClick={() => setLightboxIdx(null)} className="p-2 hover:bg-white/10 rounded-full transition">
+              <button onClick={() => { setLightboxFullSrc(null); setLightboxIdx(null); }} className="p-2 hover:bg-white/10 rounded-full transition">
                 <X size={20} />
               </button>
             </div>
@@ -231,7 +256,7 @@ export default function PhotoGalleryModal({ messages, onClose }) {
               </button>
             )}
             <ZoomableImage
-              src={photos[lightboxIdx].content}
+              src={lightboxFullSrc || photos[lightboxIdx].content}
               alt="사진"
               className="max-h-full max-w-full object-contain"
               containerClassName="w-full h-full flex items-center justify-center"

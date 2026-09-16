@@ -5,7 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import { useSession } from '@/lib/useSession';
 import { isPushSupported, subscribeToPush, unsubscribeFromPush, getCurrentSubscription } from '@/lib/push';
-import { readImageFileAsDataUrl, resizeImageFile } from '@/lib/compressImage';
+import { readImageFileAsDataUrl, resizeImageFile, CHAT_THUMBNAIL_OPTIONS } from '@/lib/compressImage';
 import { downloadDataUrl, filenameFor } from '@/lib/download';
 import AuthForm from '@/components/AuthForm';
 import AvatarModal from '@/components/AvatarModal';
@@ -172,6 +172,10 @@ export default function RoomPage() {
   // 탭해도 아무 반응이 없었다 — 그래서 같은 화면 안에서 확대 + 다운로드 버튼을
   // 보여주는 방식으로 바꾼다(사진첩의 라이트박스와 동일한 패턴).
   const [lightboxMsg, setLightboxMsg] = useState(null);
+  // 라이트박스에 표시할 원본 화질 이미지. lightboxMsg가 바뀌면 일단 null로
+  // 비워서(=말풍선과 같은 썸네일이 먼저 보임) 원본을 비동기로 가져온 뒤 채운다
+  // (아래 useEffect). 즉시 뜨는 썸네일 → 도착하는 대로 선명해지는 원본 순서.
+  const [lightboxFullSrc, setLightboxFullSrc] = useState(null);
   // 상대방 프로필 사진(아바타)을 탭했을 때 확대해서 보여주는 뷰어에 쓰는 이미지 URL
   const [avatarViewerUrl, setAvatarViewerUrl] = useState(null);
 
@@ -217,6 +221,12 @@ export default function RoomPage() {
   // 읽는 중이면 새 메시지가 와도 화면을 강제로 끌어내리지 않는다.
   const isNearBottomRef = useRef(true);
   const fileRef = useRef(null);
+  // 사진 원본(full_image)은 방 진입 시 통째로 불러오지 않고, 라이트박스로 열거나
+  // 다운로드할 때만 그때 id로 조회한다. 같은 사진을 다시 열 때마다 재조회하지
+  // 않도록 메모리에 캐시해 둔다(방을 나가면 아래 roomId 초기화 useEffect에서 비움).
+  // realtime으로 받은 새 메시지는 payload에 원본이 이미 포함돼 있으므로(Realtime은
+  // select절과 무관하게 변경된 행 전체를 보내줌) 조회 없이 여기에 바로 채워 넣는다.
+  const fullImageCacheRef = useRef(new Map());
   // "보내기" 버튼을 탭하면 포커스가 버튼으로 넘어가면서 모바일 키보드가 바로
   // 닫혀버리는 문제가 있어서, 버튼이 포커스를 가져가지 못하게 막고(mouseDown에서
   // preventDefault) 전송 후에도 입력창에 포커스를 유지시키는 데 쓴다.
@@ -251,7 +261,31 @@ export default function RoomPage() {
 
   useEffect(() => {
     if (!roomId || !session) return;
-    supabase.from('rooms').select('*').eq('id', roomId).single().then(({ data }) => {
+    let cancelled = false;
+
+    // localStorage 확인은 서버 응답과 무관하므로, 네트워크 요청을 시작하기 전에
+    // 먼저 읽어둔다.
+    const alreadyUnlocked = localStorage.getItem(`unlocked_${roomId}`) === 'true';
+    const savedNick = localStorage.getItem(`nick_${roomId}`);
+
+    // 이 기기에 저장된 닉네임이 없는(=새 기기/새 브라우저) 경우에만 필요한
+    // room_members.nickname 조회를, 예전처럼 방 조회가 끝나길 기다렸다가 그
+    // 안에서 순서대로 시작하지 않고 방 조회와 동시에 시작한다 — 두 조회가 서로
+    // 다른 값에 의존하지 않으므로 직렬로 기다릴 이유가 없다.
+    const memberPromise = savedNick
+      ? Promise.resolve(null)
+      : supabase
+          .from('room_members')
+          .select('nickname')
+          .eq('room_id', roomId)
+          .eq('user_id', session.user.id)
+          .maybeSingle();
+
+    Promise.all([
+      supabase.from('rooms').select('*').eq('id', roomId).single(),
+      memberPromise,
+    ]).then(([{ data }, memberResult]) => {
+      if (cancelled) return;
       if (!data) { setLoading(false); return; }
       setRoom(data);
       // 링크로 바로 들어온 사람도 "내 대화방 목록"에 자동 등록되도록
@@ -273,10 +307,9 @@ export default function RoomPage() {
       // 빈 세션으로 시작한다 — 비밀번호를 풀고 닉네임을 정해도 다음번에 알림을
       // 눌러 들어오면 또 처음부터 물어보던 게 이 때문이었다. localStorage는
       // 같은 기기·브라우저 안에서 탭/창에 상관없이 공유되므로 한 번만 하면 된다.
-      if (localStorage.getItem(`unlocked_${roomId}`) === 'true' || !data.password) {
+      if (alreadyUnlocked || !data.password) {
         setIsUnlocked(true);
       }
-      const savedNick = localStorage.getItem(`nick_${roomId}`);
       if (savedNick) {
         setNickname(savedNick);
         setIsJoined(true);
@@ -286,29 +319,25 @@ export default function RoomPage() {
       }
 
       // 이 기기에는 저장된 닉네임이 없는(=새 기기/새 브라우저) 경우, 같은 계정으로
-      // 다른 기기에서 이미 이 방에 입장한 적이 있는지 서버(room_members.nickname)로
-      // 확인한다. nickname 컬럼은 join() 함수(아래)에서 비밀번호를 통과하고 닉네임을
-      // 정한 뒤에만 채워지므로, 값이 있다는 사실 자체가 "과거 이 계정으로 비밀번호를
-      // 통과했다"는 증거가 된다 — 그래서 이 값이 있으면 비밀번호/닉네임 입력 화면을
-      // 건너뛰고 바로 대화창으로 들어가게 해서, 어느 기기로 로그인하든 같은 이메일
-      // 계정이면 닉네임도 같고 비밀번호도 다시 묻지 않게 한다.
-      supabase
-        .from('room_members')
-        .select('nickname')
-        .eq('room_id', roomId)
-        .eq('user_id', session.user.id)
-        .maybeSingle()
-        .then(({ data: memberRow }) => {
-          if (memberRow?.nickname) {
-            localStorage.setItem(`unlocked_${roomId}`, 'true');
-            localStorage.setItem(`nick_${roomId}`, memberRow.nickname);
-            setIsUnlocked(true);
-            setNickname(memberRow.nickname);
-            setIsJoined(true);
-          }
-          setLoading(false);
-        });
+      // 다른 기기에서 이미 이 방에 입장한 적이 있는지 서버(room_members.nickname,
+      // 위에서 방 조회와 동시에 이미 조회해 둠)로 확인한다. nickname 컬럼은
+      // join() 함수(아래)에서 비밀번호를 통과하고 닉네임을 정한 뒤에만 채워지므로,
+      // 값이 있다는 사실 자체가 "과거 이 계정으로 비밀번호를 통과했다"는 증거가
+      // 된다 — 그래서 이 값이 있으면 비밀번호/닉네임 입력 화면을 건너뛰고 바로
+      // 대화창으로 들어가게 해서, 어느 기기로 로그인하든 같은 이메일 계정이면
+      // 닉네임도 같고 비밀번호도 다시 묻지 않게 한다.
+      const memberRow = memberResult?.data;
+      if (memberRow?.nickname) {
+        localStorage.setItem(`unlocked_${roomId}`, 'true');
+        localStorage.setItem(`nick_${roomId}`, memberRow.nickname);
+        setIsUnlocked(true);
+        setNickname(memberRow.nickname);
+        setIsJoined(true);
+      }
+      setLoading(false);
     });
+
+    return () => { cancelled = true; };
   }, [roomId, session]);
 
   // 닉네임이 정해지면(직접 입력했거나 localStorage에 저장된 게 있어서
@@ -348,32 +377,56 @@ export default function RoomPage() {
     });
   };
 
+  // 비밀번호/닉네임 화면을 보고 있는 동안에도 메시지를 백그라운드로 미리
+  // 받아온다. 메시지는 어차피 isUnlocked/isJoined가 true가 될 때까지 화면에
+  // 렌더링되지 않으므로(아래 조기 return들이 그대로 화면을 가림) 표시 시점은
+  // 그대로고, 사용자가 잠금 해제/닉네임 입력을 마쳤을 때 이미 로드돼 있어 그
+  // 시점의 왕복이 사라진다.
   useEffect(() => {
-    if (!isJoined || !isUnlocked || !roomId) return;
+    if (!roomId || !session) return;
     let cancelled = false;
     let ch = null;
 
+    // 사진 원본(full_image)은 여기서 select하지 않는다 — 방의 전체 대화 기록을
+    // 열 때마다 사진 원본 화질까지 전부 받아오는 게 느린 원인이었어서, 목록에는
+    // content(작은 썸네일)만 가져오고 원본은 getFullImage()로 필요할 때만 조회한다.
     const fetchMessages = () => {
-      supabase.from('messages').select('*').eq('room_id', roomId).order('created_at', { ascending: true }).then(({ data }) => {
-        if (cancelled || !data) return;
-        setMessages(data);
-        loadProfilesFor(data.map((m) => m.user_id));
-      });
+      supabase
+        .from('messages')
+        .select('id, room_id, sender, content, created_at, user_id')
+        .eq('room_id', roomId)
+        .order('created_at', { ascending: true })
+        .then(({ data }) => {
+          if (cancelled || !data) return;
+          setMessages(data);
+          loadProfilesFor(data.map((m) => m.user_id));
+        });
+    };
+
+    // realtime(postgres_changes)은 select절과 무관하게 변경된 행 전체(full_image
+    // 포함)를 그대로 보내준다. 그걸 그대로 state에 넣으면 결국 방을 오래 쓸수록
+    // 원본이 메모리에 쌓이므로, 원본은 캐시에 빼두고 썸네일 버전만 state에 넣는다.
+    const stripFullImage = (row) => {
+      const { full_image, ...rest } = row;
+      if (full_image) fullImageCacheRef.current.set(row.id, full_image);
+      return rest;
     };
 
     const subscribe = () => {
       ch = supabase
         .channel(`room_${roomId}`)
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, (p) => {
+          const row = stripFullImage(p.new);
           setMessages((prev) => {
-            if (prev.some((m) => m.id === p.new.id)) return prev;
-            const filtered = prev.filter((m) => !(m.sender === p.new.sender && m.content === p.new.content && typeof m.id === 'number' && m.id > 1000000000000));
-            return [...filtered, p.new];
+            if (prev.some((m) => m.id === row.id)) return prev;
+            const filtered = prev.filter((m) => !(m.sender === row.sender && m.content === row.content && typeof m.id === 'number' && m.id > 1000000000000));
+            return [...filtered, row];
           });
-          loadProfilesFor([p.new.user_id]);
+          loadProfilesFor([row.user_id]);
         })
         .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, (p) => {
-          setMessages((prev) => prev.map((m) => (m.id === p.new.id ? p.new : m)));
+          const row = stripFullImage(p.new);
+          setMessages((prev) => prev.map((m) => (m.id === row.id ? row : m)));
         })
         .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` }, (p) => {
           setMessages((prev) => prev.filter((m) => m.id !== p.old.id));
@@ -408,7 +461,7 @@ export default function RoomPage() {
       window.removeEventListener('pageshow', handleWake);
       if (ch) supabase.removeChannel(ch);
     };
-  }, [isJoined, isUnlocked, roomId]);
+  }, [roomId, session]);
 
   // 방을 나갔다가(뒤로가기) 다시 들어올 때 hasScrolledOnceRef도 새로 시작하도록.
   // 대부분은 페이지 이동으로 컴포넌트 자체가 다시 마운트되어 자연히 초기화되지만,
@@ -416,7 +469,52 @@ export default function RoomPage() {
   useEffect(() => {
     hasScrolledOnceRef.current = false;
     isNearBottomRef.current = true;
+    fullImageCacheRef.current = new Map();
   }, [roomId]);
+
+  // id로 사진 "원본" 화질을 가져온다. 캐시에 있으면(전송 직후 본인 사진이거나,
+  // realtime으로 이미 받아둔 사진) 즉시 반환하고, 없으면 그때 딱 한 건만 조회한다.
+  // full_image가 null이면(이 컬럼이 생기기 전에 보낸 옛 사진 — 그때는 content 자체가
+  // 원본이었음) msg.content로 자동 폴백해서 백필 없이도 옛 사진이 그대로 보인다.
+  const getFullImage = async (msg) => {
+    if (!msg) return null;
+    const cached = fullImageCacheRef.current.get(msg.id);
+    if (cached) return cached;
+    const { data, error } = await supabase.from('messages').select('full_image').eq('id', msg.id).maybeSingle();
+    const full = !error && data?.full_image ? data.full_image : msg.content;
+    fullImageCacheRef.current.set(msg.id, full);
+    return full;
+  };
+
+  // 사진첩 일괄 다운로드처럼 여러 장을 한 번에 원본으로 바꿔야 할 때 쓰는 버전.
+  // 캐시에 없는 것만 한 번의 in() 조회로 채운다.
+  const getFullImages = async (msgs) => {
+    const missing = msgs.filter((m) => !fullImageCacheRef.current.has(m.id));
+    if (missing.length > 0) {
+      const { data } = await supabase
+        .from('messages')
+        .select('id, full_image')
+        .in('id', missing.map((m) => m.id));
+      const byId = new Map((data || []).map((r) => [r.id, r.full_image]));
+      missing.forEach((m) => {
+        fullImageCacheRef.current.set(m.id, byId.get(m.id) || m.content);
+      });
+    }
+    return msgs.map((m) => fullImageCacheRef.current.get(m.id) || m.content);
+  };
+
+  // 라이트박스가 열려 있는 동안 대상 사진이 바뀔 때마다(다른 사진을 열 때 포함)
+  // 원본을 비동기로 채운다. 위 lightboxFullSrc 선언부 주석 참고.
+  useEffect(() => {
+    if (!lightboxMsg) return;
+    let cancelled = false;
+    getFullImage(lightboxMsg).then((full) => {
+      if (!cancelled) setLightboxFullSrc(full);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [lightboxMsg]);
 
   // isNearBottomRef를 최신 상태로 유지: 사용자가 손으로 스크롤하거나(위로 스크롤
   // 해서 지난 대화 읽기), 아래 useEffect가 프로그램적으로 맨 아래로 스크롤할 때
@@ -571,18 +669,12 @@ export default function RoomPage() {
     }
   };
 
-  // 메시지 전송 성공 후 같은 방 멤버들의 다른 기기로 보낼 알림을 fire-and-forget
-  // 발송한다. 현재 브라우저의 endpoint를 함께 보내 이 기기에 자기 메시지 알림이
-  // 되돌아오는 건 막되, 같은 계정으로 로그인한 PC/폰에는 알림이 가도록 한다.
+  // 메시지 전송 성공 후 같은 방 멤버들에게 보낼 알림을 fire-and-forget 발송한다.
+  // 서버(/api/notify)가 발신 계정(senderId) 전체를 수신자에서 제외하므로, 같은
+  // 계정으로 로그인한 내 다른 기기(PC/폰 등)에는 내가 보낸 메시지 알림이 가지
+  // 않는다.
   const postNotification = async (body) => {
     if (!session?.access_token) return;
-
-    let senderEndpoint;
-    try {
-      senderEndpoint = (await getCurrentSubscription())?.endpoint;
-    } catch {
-      // 로컬 구독 확인 실패가 다른 기기의 알림 발송까지 막으면 안 된다.
-    }
 
     fetch('/api/notify', {
       method: 'POST',
@@ -591,7 +683,6 @@ export default function RoomPage() {
         roomId,
         title: room?.title || '새 메시지',
         body,
-        senderEndpoint,
       }),
     }).catch(() => {});
   };
@@ -624,14 +715,20 @@ export default function RoomPage() {
     }
   };
 
-  const send = async (content) => {
+  // fullImage: 사진일 때만 전달되는 원본 화질(선택한 화질) data URL. content는
+  // 항상 목록/말풍선용 값(텍스트는 그대로, 사진은 작은 썸네일)이다. 텍스트
+  // 메시지는 fullImage가 null이라 컬럼도 그냥 null로 들어간다.
+  const send = async (content, fullImage = null) => {
     if (!content) return;
     const tempId = Date.now();
     const nowIso = new Date().toISOString();
     const userId = session?.user?.id ?? null;
     setMessages((prev) => [...prev, { id: tempId, room_id: roomId, sender: nickname, content, created_at: nowIso, user_id: userId }]);
+    // 방금 만든 원본을 미리 캐시에 넣어둔다 — realtime 응답을 기다리지 않고도
+    // 본인이 방금 보낸 사진을 바로 확대해봤을 때 재조회 없이 즉시 보이게 한다.
+    if (fullImage) fullImageCacheRef.current.set(tempId, fullImage);
 
-    const { error } = await supabase.from('messages').insert([{ room_id: roomId, sender: nickname, content, user_id: userId }]);
+    const { error } = await supabase.from('messages').insert([{ room_id: roomId, sender: nickname, content, full_image: fullImage, user_id: userId }]);
     if (error) {
       alert('전송 실패: ' + error.message);
     } else {
@@ -642,28 +739,32 @@ export default function RoomPage() {
   // 사진 여러 장을 한 번에 전송한다. 메시지 자체는 기존 스키마 그대로 한 장당
   // 한 행으로 저장하되, 낙관적 업데이트와 insert를 배열로 한 번에 처리하고
   // 푸시 알림은 notifyPhotos로 한 번만 보내 사진 수만큼 알림이 울리는 걸 막는다.
-  const sendMany = async (contents) => {
-    if (!contents || contents.length === 0) return;
+  // items: [{ content: 썸네일, fullImage: 원본 }]
+  const sendMany = async (items) => {
+    if (!items || items.length === 0) return;
     const nowIso = new Date().toISOString();
     const userId = session?.user?.id ?? null;
-    const tempRows = contents.map((content, i) => ({
+    const tempRows = items.map((item, i) => ({
       id: Date.now() + i,
       room_id: roomId,
       sender: nickname,
-      content,
+      content: item.content,
       created_at: nowIso,
       user_id: userId,
     }));
+    tempRows.forEach((row, i) => {
+      if (items[i].fullImage) fullImageCacheRef.current.set(row.id, items[i].fullImage);
+    });
     setMessages((prev) => [...prev, ...tempRows]);
 
     const { error } = await supabase
       .from('messages')
-      .insert(contents.map((content) => ({ room_id: roomId, sender: nickname, content, user_id: userId })));
+      .insert(items.map((item) => ({ room_id: roomId, sender: nickname, content: item.content, full_image: item.fullImage, user_id: userId })));
 
     if (error) {
       alert('전송 실패: ' + error.message);
     } else {
-      notifyPhotos(contents.length);
+      notifyPhotos(items.length);
     }
   };
 
@@ -753,18 +854,23 @@ export default function RoomPage() {
     };
 
     try {
-      const contents = [];
+      // 사진마다 ① 사용자가 고른 화질의 원본(fullImage)과 ② 말풍선/사진첩 그리드에
+      // 쓸 아주 작은 썸네일(content)을 함께 만든다. content에는 항상 썸네일만
+      // 저장하고, 원본은 full_image 컬럼에 따로 저장해 방 진입 시의 전체 조회가
+      // 무거워지지 않게 한다.
+      const items = [];
       for (const { file } of pendingImages) {
-        contents.push(
+        const fullImage =
           imageQuality === 'original'
             ? await readImageFileAsDataUrl(file)
-            : await resizeImageFile(file, qualityOptions[imageQuality] || qualityOptions.high)
-        );
+            : await resizeImageFile(file, qualityOptions[imageQuality] || qualityOptions.high);
+        const content = await resizeImageFile(file, CHAT_THUMBNAIL_OPTIONS);
+        items.push({ content, fullImage });
       }
-      if (contents.length === 1) {
-        await send(contents[0]);
+      if (items.length === 1) {
+        await send(items[0].content, items[0].fullImage);
       } else {
-        await sendMany(contents);
+        await sendMany(items);
       }
     } catch (err) {
       alert('이미지 처리 중 오류가 발생했습니다: ' + (err?.message || ''));
@@ -1142,7 +1248,10 @@ export default function RoomPage() {
                         src={msg.content}
                         alt="사진"
                         className="rounded-xl max-h-64 max-w-[280px] object-cover cursor-pointer hover:opacity-95"
-                        onClick={() => setLightboxMsg(msg)}
+                        onClick={() => {
+                          setLightboxFullSrc(null);
+                          setLightboxMsg(msg);
+                        }}
                       />
                     </div>
                   ) : emojiOnlyCount ? (
@@ -1200,6 +1309,8 @@ export default function RoomPage() {
         <PhotoGalleryModal
           messages={messages}
           onClose={() => setShowPhotoGallery(false)}
+          getFullImage={getFullImage}
+          getFullImages={getFullImages}
         />
       )}
 
@@ -1213,23 +1324,26 @@ export default function RoomPage() {
             </div>
             <div className="flex items-center space-x-1">
               <button
-                onClick={() => downloadDataUrl(lightboxMsg.content, filenameFor(lightboxMsg.created_at))}
+                onClick={async () => {
+                  const full = lightboxFullSrc || await getFullImage(lightboxMsg);
+                  downloadDataUrl(full, filenameFor(lightboxMsg.created_at));
+                }}
                 className="p-2 hover:bg-white/10 rounded-full transition"
                 title="사진 다운로드"
               >
                 <Download size={19} />
               </button>
-              <button onClick={() => setLightboxMsg(null)} className="p-2 hover:bg-white/10 rounded-full transition">
+              <button onClick={() => { setLightboxFullSrc(null); setLightboxMsg(null); }} className="p-2 hover:bg-white/10 rounded-full transition">
                 <X size={20} />
               </button>
             </div>
           </div>
           <ZoomableImage
-            src={lightboxMsg.content}
+            src={lightboxFullSrc || lightboxMsg.content}
             alt="사진"
             className="max-h-full max-w-full object-contain"
             containerClassName="flex-1 flex items-center justify-center px-2 w-full h-full"
-            onTap={() => setLightboxMsg(null)}
+            onTap={() => { setLightboxFullSrc(null); setLightboxMsg(null); }}
           />
         </div>
       )}
